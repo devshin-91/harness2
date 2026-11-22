@@ -82,6 +82,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="replay newly added prohibition rules against delivered reference/pool rollouts "
         "and surface factual match counts to Compose (#199)",
     )
+    g.add_argument(
+        "--verify-library-evidence",
+        action="store_true",
+        help="run deterministic Tier 0 citation verification on <experience> evidence before "
+        "admitting lessons into the domain library (#71, #143)",
+    )
     return p
 
 
@@ -184,6 +190,7 @@ def _main(args: argparse.Namespace) -> int:
         pool_policy="finals",
         blind_compose=args.blind_compose,
         prohibition_replay=args.prohibition_replay,
+        verify_evidence=args.verify_library_evidence,
     )
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")

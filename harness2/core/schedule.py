@@ -538,6 +538,7 @@ def _run_one_mode(
     res: TaskResult,
     blind_compose: bool = False,
     prohibition_replay: bool = False,
+    verify_evidence: bool = False,
 ) -> None:
     """Run one recursion mode over the shared bases, select a final, and record it on `res`."""
     work_dir = n.task_dir(runs_root, task_id)
@@ -589,6 +590,7 @@ def _run_one_mode(
                 prop=selector,
                 work_dir=work_dir,
                 decisions={stage.label: stage.notes or stage.error for stage in r.stages},
+                verify_evidence=verify_evidence,
             )
         finally:
             res.selections[mode] = sel.to_dict()
@@ -617,6 +619,20 @@ def _run_one_mode(
             label=sel.chosen_label,
             run_id=sel.chosen_run_id,
             experience=sel.experience,
+            provenance={
+                "source": "self",
+                "mode": mode,
+                "k": k,
+                "verified_refs": sel.verified_refs,
+            },
+        )
+    elif mode_lib and sel.ok:
+        mode_lib.record_tombstone(
+            task_id,
+            reason=(sel.decline_reason.split(":", 1)[0] if sel.decline_reason else "no_entry"),
+            detail=sel.decline_reason,
+            mode=mode,
+            k=k,
         )
 
 
@@ -636,6 +652,7 @@ def run_task(
     pool_policy: str = "finals",
     blind_compose: bool = False,
     prohibition_replay: bool = False,
+    verify_evidence: bool = False,
 ) -> TaskResult:
     """k shared reference executions -> every mode -> blind selection per mode -> summary.json.
 
@@ -718,6 +735,7 @@ def run_task(
                 res=res,
                 blind_compose=blind_compose,
                 prohibition_replay=prohibition_replay,
+                verify_evidence=verify_evidence,
             )
         except Exception as exc:
             err = f"{type(exc).__name__}: {exc}"
@@ -758,6 +776,7 @@ def run_domain(
     pool_policy: str = "finals",
     blind_compose: bool = False,
     prohibition_replay: bool = False,
+    verify_evidence: bool = False,
 ) -> dict:
     """Every task in one domain, in `stream_order()` order, threading the library forward."""
     surface = adapter.substrate.surface()
@@ -792,6 +811,7 @@ def run_domain(
                 pool_policy=pool_policy,
                 blind_compose=blind_compose,
                 prohibition_replay=prohibition_replay,
+                verify_evidence=verify_evidence,
             )
             if r.status in ("ok", "skipped"):
                 out["done"] += 1
@@ -876,6 +896,7 @@ def run_sweep(
     only_tasks: Sequence[str] = (),
     blind_compose: bool = False,
     prohibition_replay: bool = False,
+    verify_evidence: bool = False,
 ) -> dict:
     """Run domains concurrently, preserving task order after stream filters are applied."""
     ordered_tasks = task_stream(
@@ -909,6 +930,7 @@ def run_sweep(
                 pool_policy=pool_policy,
                 blind_compose=blind_compose,
                 prohibition_replay=prohibition_replay,
+                verify_evidence=verify_evidence,
             ): d
             for d in order
         }

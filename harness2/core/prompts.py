@@ -1233,7 +1233,10 @@ def experience(bp: BenchPrompts) -> str:
                 "Verdicts are `helped`, `hurt`, `no observed effect` and `confounded`. Use "
                 "`confounded` -- and prefer it -- whenever a candidate changed several components at "
                 "once and no execution isolates one of them, or when a single rollout is all that "
-                "stands behind the difference. A confounded row is a useful record; an invented "
+                "stands behind the difference. One exception: a newly added skill together with its "
+                "required trigger line in always-on text is one atomic component addition, not a "
+                "multi-component confound, when trajectories show the skill was actually invoked. "
+                "A confounded row is a useful record; an invented "
                 "attribution poisons the library for every later task. Cite the run and the point in "
                 "the trajectory where behavior diverges. If two candidates changed the same component "
                 "in different ways, say which forms were tried and what each produced.",

@@ -25,8 +25,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence, TypeVar
 
-from . import context
+from . import context, evidence_gate
 from . import prompts as P
+from . import tree as harness_tree
 from .proposer import Proposer, ProposerError
 from .spec import BenchmarkAdapter, BenchPrompts, RunView, resolve_prompts
 
@@ -63,6 +64,8 @@ class Selection:
     experience: dict = field(default_factory=dict)
     trivial: bool = False
     evidence: str = "deliverable"
+    decline_reason: str = ""
+    verified_refs: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
@@ -408,6 +411,7 @@ def reflect_adoption(
     prop: Proposer,
     work_dir: Path,
     decisions: dict[str, str] | None = None,
+    verify_evidence: bool = False,
 ) -> dict:
     """Learn from harness edits, decisions, trajectories, and deliverables after adoption."""
     chosen = candidates.get(sel.chosen_label)
@@ -444,7 +448,14 @@ def reflect_adoption(
     context.assert_no_leak_paths(root, adapter.spec.leak_globs)
     context.assert_no_grader_verdicts(root)
     experience = _distil(
-        task_id, sel, candidates, adapter=adapter, prop=prop, root=root, layout=evidence.layout
+        task_id,
+        sel,
+        candidates,
+        adapter=adapter,
+        prop=prop,
+        root=root,
+        layout=evidence.layout,
+        verify_evidence=verify_evidence,
     )
     sel.experience = experience
     _persist(sel, Path(work_dir) / "selection" / f"{sel.mode}{sel.k}", str(chosen.run_dir))
@@ -461,6 +472,7 @@ def _distil(
     root: Path,
     bp: BenchPrompts | None = None,
     layout: str = "",
+    verify_evidence: bool = False,
 ) -> dict:
     """Extract a supported lesson from the complete task-local improvement record."""
     mission = "\n\n".join(
@@ -482,6 +494,7 @@ def _distil(
         reply = prop.call(mission, exp_root, f"experience.{sel.mode}{sel.k}")
     except ProposerError as exc:
         sel.usd += exc.cost_usd
+        sel.decline_reason = f"proposer_error: {exc}"[:300]
         return {}
     sel.usd += reply.cost_usd
     edits = _EDITS.search(reply.text)
@@ -489,6 +502,7 @@ def _distil(
         (root / "edits.md").write_text(edits.group(1).strip() + "\n", encoding="utf-8")
     m = _EXP.search(reply.text)
     if not m:
+        sel.decline_reason = "no_entry" if "NO_ENTRY" in reply.text else "missing_experience_block"
         return {}
     out: dict = {}
     for line in m.group(1).strip().splitlines():
@@ -498,8 +512,26 @@ def _distil(
             if key in ("cue", "lesson", "evidence", "confidence"):
                 out[key] = val.strip()
     if not all(out.get(key) for key in ("cue", "lesson", "evidence")):
+        sel.decline_reason = "missing_fields"
         return {}
     if edits:
         out["edits"] = edits.group(1).strip()
+    if verify_evidence:
+        surface = adapter.substrate.surface()
+        base_t = harness_tree.read_tree(surface, root / "base_harness")
+        chosen_t = harness_tree.read_tree(surface, root / "harness")
+        diff = harness_tree.diff_summary(surface, base_t, chosen_t)
+        changed = sorted(set(diff["added"]) | set(diff["modified"]) | set(diff["removed"]))
+        live_labels = [lbl for lbl, rv in pool.items() if rv.ok]
+        chk = evidence_gate.verify_experience_evidence(
+            out,
+            valid_labels=list(pool.keys()),
+            changed_components=changed,
+            live_labels=live_labels,
+        )
+        if not chk.ok:
+            sel.decline_reason = f"evidence_unverified: {'; '.join(chk.issues)}"[:300]
+            return {}
+        sel.verified_refs = list(chk.verified_refs)
     context.assert_tree_has_no_grader_verdicts({"EXPERIENCE.md": json.dumps(out)})
     return out

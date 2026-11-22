@@ -25,9 +25,11 @@ summary. Roots are scoped per run and mode, so each sweep starts every domain em
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
@@ -69,6 +71,51 @@ class Library:
     @property
     def index(self) -> Path:
         return self.dir / "INDEX.md"
+
+    @property
+    def tombstones_path(self) -> Path:
+        return self.dir / "tombstones.jsonl"
+
+    def record_tombstone(
+        self,
+        task_id: str,
+        *,
+        reason: str,
+        detail: str = "",
+        mode: str = "",
+        k: int = 0,
+    ) -> Path:
+        """Record why a task added no library entry (#143 Ask 2) instead of failing silently."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        row = {
+            "task_id": task_id,
+            "domain": self.domain,
+            "mode": mode,
+            "k": int(k),
+            "reason": str(reason or "no_entry"),
+            "detail": str(detail or "")[:400],
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        with self.tombstones_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return self.tombstones_path
+
+    def tombstones(self) -> list[dict]:
+        """Return all recorded tombstones for this domain library."""
+        if not self.tombstones_path.is_file():
+            return []
+        out: list[dict] = []
+        for ln in self.tombstones_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                rec = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(rec, dict):
+                out.append(rec)
+        return out
 
     def entry_dir(self, task_id: str) -> Path:
         return self.dir / "harnesses" / slug(task_id)
@@ -112,6 +159,7 @@ class Library:
         label: str = "",
         run_id: str = "",
         experience: dict | None = None,
+        provenance: dict | None = None,
     ) -> Path | None:
         """Store one adopted harness plus why it was adopted, and rebuild INDEX.md from disk.
 
@@ -146,6 +194,17 @@ class Library:
                 for f in ("cue", "lesson", "evidence", "confidence")
                 if exp.get(f)
             ]
+            lines += [""]
+        if provenance:
+            lines += ["## Provenance"]
+            for pkey in sorted(provenance):
+                pval = provenance[pkey]
+                if isinstance(pval, (list, tuple)):
+                    pval_s = ", ".join(str(x) for x in pval)
+                else:
+                    pval_s = str(pval)
+                if pval_s.strip():
+                    lines.append(f"- **{pkey}**: {pval_s.strip()}")
             lines += [""]
         (d / "EXPERIENCE.md").write_text("\n".join(lines), encoding="utf-8")
         self.rebuild_index()
