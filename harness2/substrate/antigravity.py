@@ -273,10 +273,11 @@ class AntigravitySubstrate:
         self,
         base_env: Mapping[str, str] | None = None,
         *,
+        strict_allowlist: bool | None = None,
         keep: tuple[str, ...] = (),
     ) -> dict[str, str]:
-        """Scrub host secrets before launching `agy`."""
-        return config.scrub_env(base_env, keep=keep)
+        """Scrub host secrets before launching `agy`, honoring optional strict allowlist."""
+        return config.scrub_env(base_env, keep=keep, strict_allowlist=strict_allowlist)
 
     def execute(
         self, task_ref: str, install: Install, run_ids: list[str], timeout: int

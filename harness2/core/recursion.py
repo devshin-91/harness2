@@ -268,6 +268,19 @@ def _record_sessions(ledger: Ledger, stages: Sequence[Stage]) -> None:
         ledger.session(stage.label, stage.usd, cached=stage.cached, attempts=stage.attempts)
 
 
+_INFRA_FAULT_RE = re.compile(
+    r"\b(?:429|too\s+many\s+requests|rate\s*limit|timeout|timed\s+out|oom|"
+    r"out\s+of\s+memory|connection\s+reset|terminated\s+due\s+to\s+error|"
+    r"service\s+unavailable|503|502|504)\b",
+    re.IGNORECASE,
+)
+
+
+def is_infra_fault(error: str) -> bool:
+    """Classify infrastructure outages (429/OOM/timeout) separately from strategy failures."""
+    return bool(error and _INFRA_FAULT_RE.search(error))
+
+
 def _roll(
     adapter: BenchmarkAdapter,
     ledger: Ledger,
@@ -307,7 +320,12 @@ def _roll(
             error=f"{type(exc).__name__}: {exc}",
         )
     if record:
-        ledger.rollout(label)
+        ledger.rollout(
+            label,
+            usd=rv.cost_usd,
+            ok=rv.ok,
+            infra_failed=is_infra_fault(rv.error),
+        )
     return rv
 
 
@@ -346,7 +364,12 @@ def _roll_many(
             )
         )
     for (label, _tree), rv in zip(items, got):
-        ledger.rollout(label)
+        ledger.rollout(
+            label,
+            usd=rv.cost_usd,
+            ok=rv.ok,
+            infra_failed=is_infra_fault(rv.error),
+        )
         out[label] = rv
     return out
 
@@ -397,7 +420,7 @@ def run_parallel(
     surface = adapter.substrate.surface()
     ledger = Ledger(mode="agg", task_id=task_id, k=k)
     for r in base:
-        ledger.rollout(r.label)
+        ledger.rollout(r.label, usd=r.cost_usd, ok=r.ok, infra_failed=is_infra_fault(r.error))
     result = ModeResult(mode="agg", task_id=task_id, k=k, ledger=ledger)
     result.rollouts.update({r.label: r for r in base})
     ctx_dir = work_dir / "context"
@@ -516,7 +539,7 @@ def run_sequential(
     surface = adapter.substrate.surface()
     ledger = Ledger(mode="seq", task_id=task_id, k=k)
     for r in base:
-        ledger.rollout(r.label)
+        ledger.rollout(r.label, usd=r.cost_usd, ok=r.ok, infra_failed=is_infra_fault(r.error))
     result = ModeResult(mode="seq", task_id=task_id, k=k, ledger=ledger)
     result.rollouts.update({r.label: r for r in base})
     ctx_dir = work_dir / "context"

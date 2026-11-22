@@ -44,6 +44,8 @@ class Entry:
     usd: float = 0.0
     cached: bool = False
     attempts: int = 1
+    ok: bool = True
+    infra_failed: bool = False
 
 
 @dataclass
@@ -55,8 +57,18 @@ class Ledger:
     k: int
     entries: list[Entry] = field(default_factory=list)
 
-    def rollout(self, label: str, usd: float = 0.0, *, cached: bool = False) -> None:
-        self.entries.append(Entry("rollout", label, usd, cached))
+    def rollout(
+        self,
+        label: str,
+        usd: float = 0.0,
+        *,
+        cached: bool = False,
+        ok: bool = True,
+        infra_failed: bool = False,
+    ) -> None:
+        self.entries.append(
+            Entry("rollout", label, usd, cached, ok=bool(ok), infra_failed=bool(infra_failed))
+        )
 
     def session(
         self, label: str, usd: float = 0.0, *, cached: bool = False, attempts: int = 1
@@ -66,6 +78,18 @@ class Ledger:
     @property
     def R(self) -> int:
         return sum(1 for e in self.entries if e.kind == "rollout")
+
+    @property
+    def live_rollouts(self) -> int:
+        return sum(1 for e in self.entries if e.kind == "rollout" and e.ok)
+
+    @property
+    def dead_rollouts(self) -> int:
+        return sum(1 for e in self.entries if e.kind == "rollout" and not e.ok)
+
+    @property
+    def infra_failed_rollouts(self) -> int:
+        return sum(1 for e in self.entries if e.kind == "rollout" and e.infra_failed)
 
     @property
     def P(self) -> int:
@@ -118,6 +142,9 @@ class Ledger:
             "task_id": self.task_id,
             "k": self.k,
             "R": self.R,
+            "live_rollouts": self.live_rollouts,
+            "dead_rollouts": self.dead_rollouts,
+            "infra_failed_rollouts": self.infra_failed_rollouts,
             "expected_R": expected_rollouts(self.k),
             "P": self.P,
             "session_attempts": sum(

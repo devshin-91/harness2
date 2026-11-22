@@ -1,0 +1,423 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Zero-token deterministic c8 Completion & Safety Gate for Antigravity lifecycle hooks (#161).
+
+Runs as a stdlib-only command hook (`python -m harness2.gates.completion_gate <Event>`):
+  - PreToolUse: blocks destructive commands, credential reads, and (optionally) benchmark
+    rubric hosts (`huggingface.co`, `hf.co`, `raw.githubusercontent.com`); auto-allows
+    read-only/test workspace commands when enabled to prevent confirmation fatigue.
+  - PostToolUse: records modified file paths into a per-conversation dirty queue (<10ms, 0 tok).
+  - Stop: runs deterministic checks on dirty/required artifacts (Python syntax compile,
+    24,000-byte GEMINI.md/AGENTS.md rule budget, required deliverable files & section headings,
+    optional verify command, optional external checker such as `ref_factcheck`).
+      * PASS -> `{"decision": "allow"}` (0 bytes injected into model context, 0 extra turns)
+        plus a 0-token `metadata.user_markdown` badge queued for PreInvocation.
+      * FAIL -> `{"decision": "continue", "reason": "<compact diff of up to 8 defects>"}`
+        guarded by BOTH `continuationActive` and `executionNum >= max_continuations` (default 2).
+  - PreInvocation: emits the saved 0-token `user_markdown` badge and clears it.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+AGY_RULE_MAX_BYTES = 24_000
+RULE_FILENAMES = frozenset({"GEMINI.md", "GEMINI.ko.md", "GEMINI.en.md", "AGENTS.md"})
+
+_DANGEROUS_CMD_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("DESTRUCTIVE_RM", re.compile(r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+(?:/|~|\*|\.\.)")),
+    ("DESTRUCTIVE_GIT_PUSH", re.compile(r"\bgit\s+push\b[^\n]*(?:--force|-f)\b")),
+    ("CREDENTIAL_ACCESS", re.compile(r"(?:~|/root|/home/[^/\s]+)/\.(?:ssh|aws|gcloud|netrc)\b")),
+)
+
+_BENCHMARK_LEAK_HOST_RE = re.compile(
+    r"\b(?:huggingface\.co|hf\.co|raw\.githubusercontent\.com|api\.github\.com/repos)\b",
+    re.IGNORECASE,
+)
+
+_SAFE_READONLY_CMD_RE = re.compile(
+    r"^\s*(?:pytest|python3?\s+-m\s+(?:unittest|pytest|py_compile|ref_factcheck)|"
+    r"ruff\s+check|git\s+(?:status|diff|log)|ls|dir)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class GateIssue:
+    code: str
+    target: str
+    message: str
+
+
+def _state_dir(payload: dict) -> Path:
+    root = os.environ.get("HARNESS2_GATE_STATE_DIR") or os.environ.get("PLUGIN_DATA")
+    base = Path(root) if root else Path.home() / ".cache" / "harness2-completion-gate"
+    conv_id = str(payload.get("conversationId") or "default")
+    safe = hashlib.sha1(conv_id.encode("utf-8")).hexdigest()[:12]
+    d = base / "sessions" / safe
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _workspace_root(payload: dict) -> Path:
+    ws_list = payload.get("workspacePaths") or []
+    if ws_list and isinstance(ws_list[0], str) and ws_list[0].strip():
+        return Path(ws_list[0].strip())
+    cwd = payload.get("cwd")
+    if isinstance(cwd, str) and cwd.strip():
+        return Path(cwd.strip())
+    return Path.cwd()
+
+
+def _extract_edited_path(tool_call: dict, ws_root: Path) -> Path | None:
+    args = tool_call.get("args") or {}
+    for key in ("Path", "TargetFile", "path", "file_path"):
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            p = Path(val.strip())
+            return p if p.is_absolute() else (ws_root / p)
+    return None
+
+
+def _load_dirty(state_file: Path) -> list[str]:
+    if not state_file.is_file():
+        return []
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+        return [str(x) for x in data.get("dirty", [])]
+    except Exception:
+        return []
+
+
+def _save_dirty(state_file: Path, paths: list[str]) -> None:
+    state_file.write_text(json.dumps({"dirty": sorted(set(paths))}, indent=2), encoding="utf-8")
+
+
+def evaluate_pre_tool_use(
+    payload: dict,
+    *,
+    block_leak_hosts: bool = True,
+    auto_allow_safe_cmds: bool = False,
+) -> dict:
+    """Evaluate a PreToolUse event: deny unsafe/leak commands, optionally auto-allow safe ones."""
+    tc = payload.get("toolCall") or {}
+    tname = str(tc.get("name") or "")
+    args = tc.get("args") or {}
+    cmd = str(args.get("CommandLine") or args.get("command") or "")
+
+    if tname in ("run_command", "bash", "shell") and cmd.strip():
+        for code, rx in _DANGEROUS_CMD_PATTERNS:
+            if rx.search(cmd):
+                return {
+                    "decision": "deny",
+                    "reason": f"[harness2-gate:{code}] Blocked dangerous command: {cmd[:140]}",
+                }
+        if block_leak_hosts and _BENCHMARK_LEAK_HOST_RE.search(cmd):
+            return {
+                "decision": "deny",
+                "reason": (
+                    "[harness2-gate:BENCHMARK_LEAK_HOST] Blocked command referencing restricted "
+                    "external benchmark host."
+                ),
+            }
+        if auto_allow_safe_cmds and _SAFE_READONLY_CMD_RE.match(cmd) and "&&" not in cmd and ";" not in cmd and "|" not in cmd:
+            return {"decision": "allow"}
+    return {}
+
+
+def _check_dirty_files(dirty_paths: list[Path]) -> list[GateIssue]:
+    issues: list[GateIssue] = []
+    for p in dirty_paths:
+        if not p.is_file():
+            continue
+        if p.name in RULE_FILENAMES:
+            size = len(p.read_bytes())
+            if size > AGY_RULE_MAX_BYTES:
+                issues.append(
+                    GateIssue(
+                        code="RULE_BUDGET_EXCEEDED",
+                        target=p.name,
+                        message=f"{size} bytes exceeds Antigravity {AGY_RULE_MAX_BYTES}-byte limit",
+                    )
+                )
+        if p.suffix.lower() == ".py":
+            try:
+                src = p.read_text(encoding="utf-8", errors="replace")
+                compile(src, str(p), "exec")
+            except (SyntaxError, ValueError) as exc:
+                issues.append(
+                    GateIssue(
+                        code="PY_SYNTAX_ERROR",
+                        target=p.name,
+                        message=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+    return issues
+
+
+def _check_requirements(
+    ws_root: Path,
+    required_files: list[str],
+    required_sections: list[str],
+) -> list[GateIssue]:
+    issues: list[GateIssue] = []
+    present_texts: list[str] = []
+    for rel in required_files:
+        rel_clean = rel.strip()
+        if not rel_clean:
+            continue
+        target = Path(rel_clean)
+        if not target.is_absolute():
+            target = ws_root / target
+        if not target.is_file():
+            issues.append(
+                GateIssue(
+                    code="MISSING_REQUIRED_DELIVERABLE",
+                    target=rel_clean,
+                    message=f"required deliverable `{rel_clean}` was not written",
+                )
+            )
+            continue
+        body = target.read_text(encoding="utf-8", errors="replace")
+        if not body.strip():
+            issues.append(
+                GateIssue(
+                    code="EMPTY_DELIVERABLE",
+                    target=rel_clean,
+                    message=f"required deliverable `{rel_clean}` is empty",
+                )
+            )
+        else:
+            present_texts.append(body.lower())
+
+    if required_sections and present_texts:
+        corpus = "\n".join(present_texts)
+        for sec in required_sections:
+            s = sec.strip()
+            if s and s.lower() not in corpus:
+                issues.append(
+                    GateIssue(
+                        code="MISSING_REQUIRED_SECTION",
+                        target=s,
+                        message=f"required audit/report section `{s}` is missing from deliverables",
+                    )
+                )
+    return issues
+
+
+def _run_verify_cmd(ws_root: Path, verify_cmd: str, timeout: int = 20) -> list[GateIssue]:
+    if not verify_cmd.strip():
+        return []
+    try:
+        proc = subprocess.run(
+            verify_cmd,
+            cwd=ws_root,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return [
+            GateIssue(
+                code="VERIFY_CMD_TIMEOUT",
+                target=verify_cmd[:60],
+                message=f"verification command timed out after {timeout}s",
+            )
+        ]
+    if proc.returncode != 0:
+        tail = ((proc.stderr or "") + "\n" + (proc.stdout or "")).strip()[-300:]
+        return [
+            GateIssue(
+                code="VERIFY_CMD_FAILED",
+                target=verify_cmd[:60],
+                message=f"exit={proc.returncode}: {tail}",
+            )
+        ]
+    return []
+
+
+def evaluate_stop(
+    payload: dict,
+    *,
+    dirty_paths: list[Path],
+    ws_root: Path,
+    required_files: list[str] = (),
+    required_sections: list[str] = (),
+    verify_cmd: str = "",
+    max_continuations: int = 2,
+) -> tuple[dict, str]:
+    """Evaluate Stop hook; returns `(hook_output_dict, user_badge_markdown)`."""
+    term_reason = str(payload.get("terminationReason") or "")
+    cont_active = bool(payload.get("continuationActive", False))
+    exec_num = int(payload.get("executionNum") or 0)
+
+    # Dual loop guard: continuationActive AND executionNum >= max_continuations.
+    if (
+        cont_active
+        or exec_num >= max_continuations
+        or term_reason in ("USER_CANCELED", "ERROR", "MAX_INVOCATIONS", "MAX_FORCED_INVOCATIONS")
+    ):
+        return {"decision": "allow"}, ""
+
+    issues: list[GateIssue] = []
+    issues.extend(_check_dirty_files(dirty_paths))
+    issues.extend(_check_requirements(ws_root, list(required_files), list(required_sections)))
+    if dirty_paths or required_files:
+        issues.extend(_run_verify_cmd(ws_root, verify_cmd))
+
+    if not issues:
+        checked = len(dirty_paths) + len([f for f in required_files if f.strip()])
+        badge = (
+            f"**[harness2 c8 gate: PASS]** {checked} artifact(s) verified deterministically "
+            f"(0 LLM tokens)."
+            if checked
+            else ""
+        )
+        return {"decision": "allow"}, badge
+
+    compact_lines = [
+        f"[harness2-completion-gate FAIL ({len(issues)} issue(s)); fix before finishing]:"
+    ]
+    for iss in issues[:8]:
+        compact_lines.append(f"- {iss.code} ({iss.target}): {iss.message}")
+    if len(issues) > 8:
+        compact_lines.append(f"- ... (+{len(issues) - 8} more)")
+    return {"decision": "continue", "reason": "\n".join(compact_lines)}, ""
+
+
+def build_hooks_json(python_exe: str = "python") -> dict:
+    """Return a valid Antigravity `.agents/hooks.json` wiring the deterministic completion gate."""
+    base_cmd = f"{python_exe} -m harness2.gates.completion_gate"
+    return {
+        "harness2-completion-gate": {
+            "PreToolUse": [
+                {
+                    "matcher": "run_command",
+                    "hooks": [{"type": "command", "command": f"{base_cmd} PreToolUse", "timeout": 10}],
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": "write_file|edit_file",
+                    "hooks": [{"type": "command", "command": f"{base_cmd} PostToolUse", "timeout": 10}],
+                }
+            ],
+            "PreInvocation": [
+                {"type": "command", "command": f"{base_cmd} PreInvocation", "timeout": 10}
+            ],
+            "Stop": [
+                {"type": "command", "command": f"{base_cmd} Stop", "timeout": 25}
+            ],
+        }
+    }
+
+
+def _csv_env(name: str) -> list[str]:
+    raw = os.environ.get(name, "")
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv[1:] if argv is None else argv
+    event = args[0] if args else "unknown"
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        payload = {}
+
+    sdir = _state_dir(payload)
+    dirty_file = sdir / "dirty_state.json"
+    badge_file = sdir / "last_badge.json"
+    ws_root = _workspace_root(payload)
+
+    if event == "PreToolUse":
+        out = evaluate_pre_tool_use(
+            payload,
+            block_leak_hosts=os.environ.get("HARNESS2_BLOCK_LEAK_HOSTS", "1") != "0",
+            auto_allow_safe_cmds=os.environ.get("HARNESS2_AUTO_ALLOW_SAFE", "0") == "1",
+        )
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+
+    if event == "PostToolUse":
+        if not payload.get("error"):
+            target = _extract_edited_path(payload.get("toolCall") or {}, ws_root)
+            if target is not None and target.exists():
+                cur = _load_dirty(dirty_file)
+                cur.append(str(target))
+                _save_dirty(dirty_file, cur)
+        print("{}")
+        return 0
+
+    if event == "PreInvocation":
+        if badge_file.is_file():
+            try:
+                out = json.loads(badge_file.read_text(encoding="utf-8"))
+                badge_file.unlink(missing_ok=True)
+                print(json.dumps(out, ensure_ascii=False))
+                return 0
+            except Exception:
+                pass
+        print("{}")
+        return 0
+
+    if event == "Stop":
+        dirty_paths = [Path(p) for p in _load_dirty(dirty_file)]
+        _save_dirty(dirty_file, [])
+        max_cont = int(os.environ.get("HARNESS2_MAX_CONTINUATIONS", "2"))
+        out, badge = evaluate_stop(
+            payload,
+            dirty_paths=dirty_paths,
+            ws_root=ws_root,
+            required_files=_csv_env("HARNESS2_REQUIRED_FILES"),
+            required_sections=_csv_env("HARNESS2_REQUIRED_SECTIONS"),
+            verify_cmd=os.environ.get("HARNESS2_VERIFY_CMD", ""),
+            max_continuations=max_cont,
+        )
+        if badge:
+            badge_payload = {
+                "injectSteps": [
+                    {
+                        "systemMessage": {
+                            "systemMessage": "",
+                            "metadata": {"user_markdown": badge},
+                        }
+                    }
+                ]
+            }
+            badge_file.write_text(json.dumps(badge_payload, ensure_ascii=False), encoding="utf-8")
+        print(json.dumps(out, ensure_ascii=False))
+        return 0
+
+    print("{}")
+    return 0
+
+
+if __name__ == "__main__":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    raise SystemExit(main())

@@ -224,10 +224,70 @@ SCRUB_ENV = frozenset(
 )
 
 
-def scrub_env(
+STRICT_ENV = env("HARNESS2_STRICT_ENV", "0") in ("1", "true", "True", "yes")
+
+STRICT_ENV_ALLOWLIST = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "PATHEXT",
+        "WINDIR",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_STATE_HOME",
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CLOUD_LOCATION",
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "NO_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+    }
+)
+
+
+def scrub_env_allowlist(
     base_env: Mapping[str, str] | None = None, *, keep: Iterable[str] = ()
 ) -> dict[str, str]:
-    """Return a copy of `base_env` (default `os.environ`) with runner and host secrets removed."""
+    """Default-deny environment builder (#219): pass ONLY essential OS/runtime vars + `keep`."""
+    src = os.environ if base_env is None else base_env
+    allowed = STRICT_ENV_ALLOWLIST | set(keep)
+    if os.name == "nt":
+        allowed_upper = {k.upper() for k in allowed}
+        return {k: v for k, v in src.items() if k.upper() in allowed_upper}
+    return {k: v for k, v in src.items() if k in allowed}
+
+
+def scrub_env(
+    base_env: Mapping[str, str] | None = None,
+    *,
+    keep: Iterable[str] = (),
+    strict_allowlist: bool | None = None,
+) -> dict[str, str]:
+    """Return a copy of `base_env` (default `os.environ`) with runner and host secrets removed.
+
+    Pass `strict_allowlist=True` (or set `HARNESS2_STRICT_ENV=1`) to use the default-deny
+    allowlist (`scrub_env_allowlist`) instead of the blocklist (#219).
+    """
+    use_strict = STRICT_ENV if strict_allowlist is None else bool(strict_allowlist)
+    if use_strict:
+        return scrub_env_allowlist(base_env, keep=keep)
     src = os.environ if base_env is None else base_env
     drop = SCRUB_ENV - set(keep)
     return {k: v for k, v in src.items() if k not in drop}
