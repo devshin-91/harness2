@@ -82,7 +82,8 @@ _EXFIL_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     (
         "CREDENTIAL_PATH_ACCESS",
         re.compile(
-            r"(?:~|\$HOME|%USERPROFILE%|/root|/home/[^/\s]+|/Users/[^/\s]+)"
+            r"(?:~|\$HOME|%USERPROFILE%|/root|/home/[^/\s]+|/Users/[^/\s]+|"
+            r"[A-Za-z]:[/\\]Users[/\\][^/\\\s]+)"
             r"(?:[/\\]\.(?:ssh|aws|gcloud|netrc)|[/\\]\.config[/\\]gcloud)\b",
             re.IGNORECASE,
         ),
@@ -273,11 +274,15 @@ def verify_receipt(
             f"!= expected={expected_commit_sha!r}"
         )
     key = hmac_key or os.environ.get("HARNESS2_RECEIPT_HMAC_KEY", "")
+    sig = str(receipt.get("signature_hmac_sha256") or "")
     if key:
-        sig = str(receipt.get("signature_hmac_sha256") or "")
         expected_sig = compute_receipt_hmac(receipt, key)
         if not sig or not hmac.compare_digest(sig, expected_sig):
             errs.append("receipt HMAC-SHA256 signature missing or invalid (fail-closed)")
+    elif sig:
+        errs.append(
+            "receipt carries HMAC-SHA256 signature but no HMAC key was supplied to verify it (fail-closed)"
+        )
 
     resolved_paths: dict[str, Path] = {}
     stored_paths = receipt.get("artifact_paths")
@@ -507,8 +512,15 @@ def scan_harness_security(tree: Mapping[str, str]) -> list[SecurityFinding]:
                             message=desc,
                         )
                     )
-        # File-level multi-line exfiltration check (e.g. os.environ + urllib.request/requests).
-        if _NET_CLIENT_RE.search(body) and _SECRET_READ_RE.search(body):
+        # File-level multi-line exfiltration check strictly on code/executable surfaces
+        # (avoids false positives on Markdown prose mentioning curl/os.environ in rules).
+        is_code_file = (
+            norm.endswith((".py", ".sh", ".ts", ".js", ".ps1", ".bat", ".cmd"))
+            or norm in (".agents/hooks.json", ".codex/hooks.json")
+            or norm.startswith(("scripts/", "plugin/"))
+            or "/scripts/" in norm
+        )
+        if is_code_file and _NET_CLIENT_RE.search(body) and _SECRET_READ_RE.search(body):
             findings.append(
                 SecurityFinding(
                     file_rel=norm,

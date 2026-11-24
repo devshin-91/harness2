@@ -254,18 +254,29 @@ class SecurityGatesAndPromoteTests(unittest.TestCase):
             )
             self.assertNotEqual(res.get("decision"), "allow", f"must NOT auto-allow {bad_cmd!r}")
 
-        self.assertEqual(
-            completion_gate.evaluate_pre_tool_use(
-                {"toolCall": {"name": "run_command", "args": {"CommandLine": "rm -fr /"}}}
-            ).get("decision"),
-            "deny",
-        )
-        self.assertEqual(
-            completion_gate.evaluate_pre_tool_use(
-                {"toolCall": {"name": "read_file", "args": {"Path": "~/.config/gcloud/adc.json"}}}
-            ).get("decision"),
-            "deny",
-        )
+        for denied_cmd in (
+            "rm -fr /",
+            "echo ok;rm -rf /",
+            "true&&rm -rf /",
+            'bash -c "rm -rf /"',
+            "git push --force;true",
+            "git -C . push --force",
+        ):
+            self.assertEqual(
+                completion_gate.evaluate_pre_tool_use(
+                    {"toolCall": {"name": "run_command", "args": {"CommandLine": denied_cmd}}}
+                ).get("decision"),
+                "deny",
+                f"expected deny for {denied_cmd!r}",
+            )
+        for cred_path in ("~/.config/gcloud/adc.json", r"C:\Users\alice\.ssh\id_rsa"):
+            self.assertEqual(
+                completion_gate.evaluate_pre_tool_use(
+                    {"toolCall": {"name": "read_file", "args": {"Path": cred_path}}}
+                ).get("decision"),
+                "deny",
+                f"expected deny for {cred_path!r}",
+            )
         # Safe --force-with-lease must NOT be falsely denied.
         self.assertEqual(
             completion_gate.evaluate_pre_tool_use(
@@ -358,6 +369,21 @@ class SecurityGatesAndPromoteTests(unittest.TestCase):
         manifest = json.loads((prod / "promotion_manifest.json").read_text(encoding="utf-8"))
         ok_m, errs_m = evidence_gate.verify_receipt(manifest)
         self.assertTrue(ok_m, errs_m)
+
+        # OpenCode surface with 0-byte placeholder guardrails.md must ALSO pass verify_receipt!
+        from harness2.substrate import OPENCODE_SURFACE
+
+        oc_src = self.root / "oc_src"
+        oc_src.mkdir()
+        (oc_src / "systemprompt.md").write_text("# OC System\n", encoding="utf-8")
+        (oc_src / "guardrails.md").write_text("", encoding="utf-8")
+        oc_dst = self.root / "oc_prod"
+        oc_res = promote.promote_harness(oc_src, oc_dst, surface=OPENCODE_SURFACE)
+        self.assertTrue(oc_res.ok, oc_res.errors)
+        oc_manifest = json.loads((oc_dst / "promotion_manifest.json").read_text(encoding="utf-8"))
+        ok_oc, errs_oc = evidence_gate.verify_receipt(oc_manifest)
+        self.assertTrue(ok_oc, errs_oc)
+        self.assertIn("guardrails.md", oc_manifest["empty_files"])
 
         # 4. config & ledger invariants: GOOGLE_APPLICATION_CREDENTIALS dropped unless kept; auth 401/403;
         #    contradictory ok=True + infra_failed=True rejected.

@@ -136,8 +136,13 @@ def promote_harness(
                 ):
                     tail_start = evolved_primary.index(PINNED_POLICY_END) + len(PINNED_POLICY_END)
                     evolved_primary = evolved_primary[tail_start:]
-                combined = PINNED_POLICY_BANNER + policy_text + PINNED_POLICY_END + evolved_primary
-                promoted_tree[primary] = combined
+                if PINNED_POLICY_BANNER in evolved_primary or PINNED_POLICY_END in evolved_primary:
+                    errors.append(
+                        f"evolved {primary} contains duplicate or stray pinned policy markers"
+                    )
+                else:
+                    combined = PINNED_POLICY_BANNER + policy_text + PINNED_POLICY_END + evolved_primary
+                    promoted_tree[primary] = combined
 
     # 2. Surface schema & compilation check on the merged tree (UTF-8 bytes enforced on byte surfaces).
     if not errors:
@@ -206,7 +211,9 @@ def promote_harness(
 
     removed_stale: list[str] = []
     file_hashes: dict[str, str] = {}
+    artifact_hashes: dict[str, str] = {}
     artifact_paths: dict[str, str] = {}
+    empty_files: list[str] = []
     if not dry_run:
         dst.mkdir(parents=True, exist_ok=True)
         dst_resolved = dst.resolve()
@@ -227,8 +234,13 @@ def promote_harness(
                 raise ValueError(f"promoted path escapes target_dir: {rel!r}")
             _write_lf(dest_file, promoted_tree[rel])
             # Hash the ACTUAL bytes written on disk so Windows & POSIX receipts match 100%.
-            file_hashes[norm_rel] = evidence_gate.sha256_file(dest_file)
-            artifact_paths[norm_rel] = str(dest_file)
+            digest = evidence_gate.sha256_file(dest_file)
+            file_hashes[norm_rel] = digest
+            if dest_file.stat().st_size > 0:
+                artifact_hashes[norm_rel] = digest
+                artifact_paths[norm_rel] = str(dest_file)
+            else:
+                empty_files.append(norm_rel)
     else:
         for rel in sorted(promoted_tree):
             norm_rel = harness_tree.normalize_rel(rel)
@@ -249,8 +261,9 @@ def promote_harness(
             "command": verify_cmd.strip(),
             "input_digest": input_digest,
             "pinned_policy_sha256": pinned_sha,
-            "artifact_hashes": file_hashes,
+            "artifact_hashes": artifact_hashes,
             "artifact_paths": artifact_paths,
+            "empty_files": sorted(empty_files),
             "files": file_hashes,
             "removed_stale_files": sorted(removed_stale),
         }

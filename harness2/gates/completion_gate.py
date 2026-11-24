@@ -46,11 +46,12 @@ AGY_RULE_MAX_BYTES = 24_000
 RULE_FILENAMES = frozenset({"GEMINI.md", "GEMINI.ko.md", "GEMINI.en.md", "AGENTS.md"})
 
 _DESTRUCTIVE_GIT_PUSH_RE = re.compile(
-    r"\bgit\s+push\b[^\n]*(?:(?:--force(?!-with-lease)|-f)(?:\s|$)|\s\+\S+)",
+    r"\bgit(?:\s+-\S+(?:\s+\S+)?)*\s+push\b[^\n]*(?:(?:--force(?!-with-lease)|-f)(?:\s|[;&|]|$)|\s\+\S+)",
     re.IGNORECASE,
 )
 _CREDENTIAL_PATH_RE = re.compile(
-    r"(?:~|\$HOME|%USERPROFILE%|/root|/home/[^/\s]+|/Users/[^/\s]+)"
+    r"(?:~|\$HOME|%USERPROFILE%|/root|/home/[^/\s]+|/Users/[^/\s]+|"
+    r"[A-Za-z]:[/\\]Users[/\\][^/\\\s]+)"
     r"(?:[/\\]\.(?:ssh|aws|gcloud|netrc)|[/\\]\.config[/\\]gcloud)\b",
     re.IGNORECASE,
 )
@@ -74,39 +75,53 @@ class GateIssue:
     message: str
 
 
-def _is_destructive_rm(cmd: str) -> bool:
-    """Detect `rm` with recursive + force flags in any order/separation targeting broad paths."""
-    if not re.search(r"\brm\b", cmd):
+_CMD_SPLIT_RE = re.compile(r"(?:&&|\|\||[;|&`$\r\n])+")
+
+
+def _is_destructive_rm(cmd: str, _depth: int = 0) -> bool:
+    """Detect `rm` with recursive + force flags across chained segments and nested shell `-c`."""
+    if _depth > 2 or not re.search(r"\brm\b", cmd):
         return False
-    try:
-        tokens = shlex.split(cmd, posix=(os.name != "nt"))
-    except ValueError:
-        tokens = cmd.split()
-    for i, tok in enumerate(tokens):
-        if tok.lower() not in ("rm", "/bin/rm", "/usr/bin/rm"):
-            continue
-        has_r = False
-        has_f = False
-        targets: list[str] = []
-        for arg in tokens[i + 1 :]:
-            if arg in (";", "&&", "||", "|", "&"):
-                break
-            if arg == "--recursive":
-                has_r = True
-            elif arg == "--force":
-                has_f = True
-            elif arg.startswith("-") and not arg.startswith("--"):
-                flags = arg[1:]
-                if "r" in flags or "R" in flags:
+    # Check both full shlex tokens (for `bash -c "rm -rf /"`) and operator-split segments
+    # (for unspaced chains like `echo ok;rm -rf /` or `true&&rm -rf /`).
+    candidates = [cmd] + [seg.strip() for seg in _CMD_SPLIT_RE.split(cmd) if seg.strip()]
+    for seg in candidates:
+        try:
+            tokens = shlex.split(seg, posix=(os.name != "nt"))
+        except ValueError:
+            tokens = seg.split()
+        for i, tok in enumerate(tokens):
+            low = tok.lower().strip("\"'")
+            # Recurse into nested shell invocations (`bash -c "..."`, `sh -c "..."`, `cmd /c "..."`).
+            if low in ("bash", "sh", "zsh", "dash", "cmd", "cmd.exe", "powershell", "pwsh"):
+                for j in range(i + 1, len(tokens) - 1):
+                    if tokens[j].lower() in ("-c", "/c", "-command"):
+                        if _is_destructive_rm(tokens[j + 1].strip("\"'"), _depth=_depth + 1):
+                            return True
+            if low not in ("rm", "/bin/rm", "/usr/bin/rm"):
+                continue
+            has_r = False
+            has_f = False
+            targets: list[str] = []
+            for arg in tokens[i + 1 :]:
+                if arg in (";", "&&", "||", "|", "&"):
+                    break
+                if arg == "--recursive":
                     has_r = True
-                if "f" in flags:
+                elif arg == "--force":
                     has_f = True
-            else:
-                targets.append(arg.strip("\"'"))
-        if has_r and has_f and any(
-            t in _DANGEROUS_RM_TARGETS or t.startswith(("/", "~", "..", "*")) for t in targets
-        ):
-            return True
+                elif arg.startswith("-") and not arg.startswith("--"):
+                    flags = arg[1:]
+                    if "r" in flags or "R" in flags:
+                        has_r = True
+                    if "f" in flags:
+                        has_f = True
+                else:
+                    targets.append(arg.strip("\"'"))
+            if has_r and has_f and any(
+                t in _DANGEROUS_RM_TARGETS or t.startswith(("/", "~", "..", "*")) for t in targets
+            ):
+                return True
     return False
 
 
