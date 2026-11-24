@@ -293,7 +293,9 @@ def scrub_env(
     allowlist (`scrub_env_allowlist`) instead of the blocklist (#219).
     """
     if strict_allowlist is None:
-        use_strict = env("HARNESS2_STRICT_ENV", "0") in ("1", "true", "True", "yes")
+        use_strict = STRICT_ENV or (
+            env("HARNESS2_STRICT_ENV", "0") in ("1", "true", "True", "yes")
+        )
     else:
         use_strict = bool(strict_allowlist)
     if use_strict:

@@ -525,6 +525,8 @@ def _distil(
         changed = sorted(set(diff["added"]) | set(diff["modified"]) | set(diff["removed"]))
         live_labels = [lbl for lbl, rv in pool.items() if rv.ok]
         delivered_labels = [lbl for lbl, rv in pool.items() if rv.ok and rv.delivered]
+        if not delivered_labels and adapter.spec.state_deliverable:
+            delivered_labels = [lbl for lbl in live_labels if pool[lbl].run_dir]
         artifact_paths = {lbl: rv.run_dir for lbl, rv in pool.items() if rv.run_dir}
         input_digest = evidence_gate.sha256_mapping(
             {

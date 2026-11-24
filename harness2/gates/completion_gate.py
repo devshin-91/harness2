@@ -46,26 +46,105 @@ AGY_RULE_MAX_BYTES = 24_000
 RULE_FILENAMES = frozenset({"GEMINI.md", "GEMINI.ko.md", "GEMINI.en.md", "AGENTS.md"})
 
 _DESTRUCTIVE_GIT_PUSH_RE = re.compile(
-    r"\bgit(?:\s+-\S+(?:\s+\S+)?)*\s+push\b[^\n]*(?:(?:--force(?!-with-lease)|-f)(?:\s|[;&|]|$)|\s\+\S+)",
+    r"\bgit(?:\s+-\S+(?:\s+\S+)?)*\s+push\b[^\n]*"
+    r"(?:(?:--force(?!-with-lease)|-[a-z]*f[a-z]*)(?:\s|[;&|]|$)|\s\+\S+)",
     re.IGNORECASE,
 )
 _CREDENTIAL_PATH_RE = re.compile(
-    r"(?:~|\$HOME|%USERPROFILE%|/root|/home/[^/\s]+|/Users/[^/\s]+|"
+    r"(?:~|\$\{?HOME\}?|%USERPROFILE%|/root|/home/[^/\s]+|/Users/[^/\s]+|"
     r"[A-Za-z]:[/\\]Users[/\\][^/\\\s]+)"
-    r"(?:[/\\]\.(?:ssh|aws|gcloud|netrc)|[/\\]\.config[/\\]gcloud)\b",
+    r"(?:[/\\]\.(?:ssh|aws|gcloud|netrc)|[/\\]\.config[/\\]gcloud|"
+    r"[/\\]\.gemini[/\\]antigravity-cli[/\\]settings\.json)\b",
     re.IGNORECASE,
 )
 _BENCHMARK_LEAK_HOST_RE = re.compile(
     r"\b(?:huggingface\.co|hf\.co|raw\.githubusercontent\.com|api\.github\.com/repos)\b",
     re.IGNORECASE,
 )
-_SAFE_READONLY_CMD_RE = re.compile(
-    r"^\s*(?:pytest|python3?\s+-m\s+(?:unittest|pytest|py_compile|ref_factcheck)|"
-    r"ruff\s+check|git\s+(?:status|diff|log)|ls|dir)(?:\s|$)",
-    re.IGNORECASE,
-)
 _SHELL_META_RE = re.compile(r"[;&|`$><\r\n]")
-_DANGEROUS_RM_TARGETS = frozenset({"/", "~", "*", "..", "/*", "~/", "../"})
+_DANGEROUS_RM_TARGETS = frozenset(
+    {"/", "~", "*", "..", ".", "./", ".\\", "/*", "~/", "../", "$home", "${home}", "%userprofile%"}
+)
+_ALLOWED_EMPTY_FILENAMES = frozenset({"__init__.py", "py.typed"})
+_DOTTED_MODULE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+_SAFE_PYTEST_REL_RE = re.compile(r"^tests/(?!.*\.\.)[A-Za-z0-9_./-]+(?:::[A-Za-z0-9_.-]+)*$")
+
+
+def _normalize_path_text(text: str) -> str:
+    """Collapse `/./` and duplicate slashes so credential-path checks cannot be bypassed."""
+    norm = re.sub(r"\\{2,}", r"\\", text)
+    norm = re.sub(r"/{2,}", "/", norm)
+    norm = re.sub(r"/(?:\./)+", "/", norm)
+    norm = re.sub(r"\\(?:\.\\)+", r"\\", norm)
+    return norm
+
+
+def _has_credential_path(text: str) -> bool:
+    return bool(_CREDENTIAL_PATH_RE.search(text) or _CREDENTIAL_PATH_RE.search(_normalize_path_text(text)))
+
+
+def _is_safe_readonly_cmd(cmd: str) -> bool:
+    """Strict token-level allowlist for `auto_allow_safe_cmds` (zero arbitrary code/file writes)."""
+    if not cmd.strip() or _SHELL_META_RE.search(cmd) or _has_credential_path(cmd):
+        return False
+    try:
+        tokens = shlex.split(cmd, posix=(os.name != "nt"))
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    head = tokens[0].lower()
+    rest = tokens[1:]
+    if head in ("ls", "dir"):
+        return True
+    if head == "git":
+        if not rest or rest[0].lower() not in ("status", "diff", "log"):
+            return False
+        for a in rest[1:]:
+            al = a.lower()
+            if al in ("-o", "--output", "--ext-diff") or al.startswith(("--output=", "--exec")):
+                return False
+        return True
+    if head == "ruff":
+        if not rest or rest[0].lower() != "check":
+            return False
+        for a in rest[1:]:
+            al = a.lower()
+            if al in ("--fix", "--fix-only", "--unsafe-fixes", "-o", "--output-file", "--add-noqa") or al.startswith(
+                ("--output-file=", "--fix")
+            ):
+                return False
+        return True
+    if head in ("python", "python3"):
+        if len(rest) >= 2 and rest[0] == "-m" and rest[1] == "unittest":
+            safe_flags = {"-v", "--verbose", "-q", "--quiet", "-f", "--failfast", "-b", "--buffer"}
+            for a in rest[2:]:
+                if a in safe_flags:
+                    continue
+                if a.startswith("-") or not _DOTTED_MODULE_RE.match(a) or a == "discover":
+                    return False
+            return True
+        if len(rest) >= 2 and rest[0] == "-m" and rest[1] == "ref_factcheck":
+            return len(rest) >= 3 and rest[2] in ("check", "evidence")
+        return False
+    if head == "pytest":
+        safe_flags = {"-q", "-v", "-vv", "-x", "-s", "--no-header"}
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a in safe_flags or a.startswith("--tb="):
+                i += 1
+                continue
+            if a == "-k" and i + 1 < len(rest):
+                i += 2
+                continue
+            if a.startswith("-"):
+                return False
+            if not _SAFE_PYTEST_REL_RE.match(a.replace("\\", "/")):
+                return False
+            i += 1
+        return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -92,10 +171,11 @@ def _is_destructive_rm(cmd: str, _depth: int = 0) -> bool:
             tokens = seg.split()
         for i, tok in enumerate(tokens):
             low = tok.lower().strip("\"'")
-            # Recurse into nested shell invocations (`bash -c "..."`, `sh -c "..."`, `cmd /c "..."`).
+            # Recurse into nested shell invocations (`bash -c`, `bash -lc`, `sh -ec`, `cmd /c`).
             if low in ("bash", "sh", "zsh", "dash", "cmd", "cmd.exe", "powershell", "pwsh"):
                 for j in range(i + 1, len(tokens) - 1):
-                    if tokens[j].lower() in ("-c", "/c", "-command"):
+                    flag = tokens[j].lower()
+                    if flag in ("-c", "/c", "-command") or re.fullmatch(r"-[a-z]*c", flag):
                         if _is_destructive_rm(tokens[j + 1].strip("\"'"), _depth=_depth + 1):
                             return True
             if low not in ("rm", "/bin/rm", "/usr/bin/rm"):
@@ -119,7 +199,9 @@ def _is_destructive_rm(cmd: str, _depth: int = 0) -> bool:
                 else:
                     targets.append(arg.strip("\"'"))
             if has_r and has_f and any(
-                t in _DANGEROUS_RM_TARGETS or t.startswith(("/", "~", "..", "*")) for t in targets
+                t.lower() in _DANGEROUS_RM_TARGETS
+                or t.lower().startswith(("/", "~", "..", "*", "$home/", "${home}/", "%userprofile%/", "%userprofile%\\"))
+                for t in targets
             ):
                 return True
     return False
@@ -188,7 +270,7 @@ def evaluate_pre_tool_use(
         target_path = str(
             args.get("Path") or args.get("AbsolutePath") or args.get("path") or args.get("file_path") or ""
         )
-        if target_path and _CREDENTIAL_PATH_RE.search(target_path):
+        if target_path and _has_credential_path(target_path):
             return {
                 "decision": "deny",
                 "reason": f"[harness2-gate:CREDENTIAL_ACCESS] Blocked read of credential path: {target_path[:140]}",
@@ -207,7 +289,7 @@ def evaluate_pre_tool_use(
                 "decision": "deny",
                 "reason": f"[harness2-gate:DESTRUCTIVE_GIT_PUSH] Blocked force-push command: {cmd[:140]}",
             }
-        if _CREDENTIAL_PATH_RE.search(cmd):
+        if _has_credential_path(cmd):
             return {
                 "decision": "deny",
                 "reason": f"[harness2-gate:CREDENTIAL_ACCESS] Blocked credential access: {cmd[:140]}",
@@ -220,7 +302,7 @@ def evaluate_pre_tool_use(
                     "external benchmark host."
                 ),
             }
-        if auto_allow_safe_cmds and _SAFE_READONLY_CMD_RE.match(cmd) and not _SHELL_META_RE.search(cmd):
+        if auto_allow_safe_cmds and _is_safe_readonly_cmd(cmd):
             return {"decision": "allow"}
     return {}
 
@@ -325,10 +407,15 @@ def _check_requirements(
 def _run_verify_cmd(ws_root: Path, verify_cmd: str, timeout: int = 20) -> list[GateIssue]:
     if not verify_cmd.strip():
         return []
+    # Never leak the receipt HMAC signing key into untrusted verify_cmd subprocesses.
+    verify_env = {
+        k: v for k, v in os.environ.items() if k.upper() != "HARNESS2_RECEIPT_HMAC_KEY"
+    }
     try:
         proc = subprocess.run(
             verify_cmd,
             cwd=ws_root,
+            env=verify_env,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -418,6 +505,8 @@ def _collect_artifact_hashes(
             )
             continue
         if p.stat().st_size == 0:
+            if p.name in _ALLOWED_EMPTY_FILENAMES:
+                continue
             missing_issues.append(
                 GateIssue(
                     code="EMPTY_ARTIFACT",
@@ -429,6 +518,38 @@ def _collect_artifact_hashes(
         hashes[key] = _sha256_file(p)
         paths_map[key] = str(p.resolve())
     return hashes, paths_map, missing_issues
+
+
+def _git_modified_paths(ws_root: Path) -> list[Path]:
+    """Best-effort list of workspace files modified/created by a shell `run_command`."""
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=ws_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+        )
+        if proc.returncode != 0:
+            return []
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found: list[Path] = []
+    for line in proc.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        rel = line[3:].strip().strip('"')
+        if " -> " in rel:
+            rel = rel.split(" -> ", 1)[1].strip().strip('"')
+        if not rel or rel.endswith("/"):
+            continue
+        cand = ws_root / rel
+        if cand.is_file():
+            found.append(cand)
+    return found
 
 
 def evaluate_stop(
@@ -517,10 +638,11 @@ def evaluate_stop(
     if dirty_paths or required_files or verify_cmd.strip():
         issues.extend(_run_verify_cmd(ws_root, verify_cmd))
 
+    status = "FAIL" if issues else ("PASS" if artifact_hashes else "NOOP")
     receipt_data: dict = {
         "schema_version": "1",
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "status": "PASS" if not issues else "FAIL",
+        "status": status,
         "commit_sha": commit_sha,
         "command": verify_cmd.strip(),
         "input_digest": input_digest,
@@ -573,13 +695,13 @@ def build_hooks_json(python_exe: str = "python") -> dict:
         "harness2-completion-gate": {
             "PreToolUse": [
                 {
-                    "matcher": "run_command|read_file|view_file",
+                    "matcher": "run_command|read_file|view_file|read_resource",
                     "hooks": [{"type": "command", "command": f"{base_cmd} PreToolUse", "timeout": 10}],
                 }
             ],
             "PostToolUse": [
                 {
-                    "matcher": "write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content",
+                    "matcher": "write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content|run_command",
                     "hooks": [{"type": "command", "command": f"{base_cmd} PostToolUse", "timeout": 10}],
                 }
             ],
@@ -623,10 +745,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if event == "PostToolUse":
         if not payload.get("error"):
-            target = _extract_edited_path(payload.get("toolCall") or {}, ws_root)
+            tc = payload.get("toolCall") or {}
+            tname = str(tc.get("name") or "")
+            new_paths: list[str] = []
+            target = _extract_edited_path(tc, ws_root)
             if target is not None and target.exists():
+                new_paths.append(str(target))
+            elif tname in ("run_command", "bash", "shell"):
+                new_paths.extend(str(p) for p in _git_modified_paths(ws_root))
+            if new_paths:
                 cur = _load_dirty(dirty_file)
-                cur.append(str(target))
+                cur.extend(new_paths)
                 _save_dirty(dirty_file, cur)
         print("{}")
         return 0
@@ -659,8 +788,8 @@ def main(argv: list[str] | None = None) -> int:
             require_artifacts=req_artifacts,
             receipt_out=receipt_data,
         )
-        # Clear dirty queue ONLY on PASS (or hard abort), never on FAIL!
-        if receipt_data.get("status") in ("PASS", "ABORTED"):
+        # Clear dirty queue ONLY on PASS/NOOP/ABORTED, never on FAIL!
+        if receipt_data.get("status") in ("PASS", "NOOP", "ABORTED"):
             _save_dirty(dirty_file, [])
         if receipt_data:
             receipt_path = Path(
@@ -685,6 +814,9 @@ def main(argv: list[str] | None = None) -> int:
                 ]
             }
             badge_file.write_text(json.dumps(badge_payload, ensure_ascii=False), encoding="utf-8")
+        else:
+            # Clear any stale PASS badge from an earlier turn so a FAIL never shows a stale PASS.
+            badge_file.unlink(missing_ok=True)
         print(json.dumps(out, ensure_ascii=False))
         return 0
 

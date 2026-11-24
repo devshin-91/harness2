@@ -32,6 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from . import ledger as ledger_store
 from . import library as library_store
 from . import recursion, runmark, selection
 from . import tree as harness_tree
@@ -215,12 +216,19 @@ def _restore_libraries(
         lib = libraries.get(mode)
         sel = selections.get(mode) or {}
         label = str(sel.get("chosen_label") or "")
-        if (
-            not lib
-            or not label
-            or not sel.get("ok")
-            or not library_store.has_experience(sel.get("experience"))
-        ):
+        if not lib or not sel.get("ok"):
+            continue
+        if not library_store.has_experience(sel.get("experience")):
+            decline = str(sel.get("decline_reason") or "")
+            lib.record_tombstone(
+                task_id,
+                reason=(decline.split(":", 1)[0] if decline else "no_entry"),
+                detail=decline,
+                mode=mode,
+                k=k,
+            )
+            continue
+        if not label:
             continue
         n = Namespace(adapter.spec.name, adapter.substrate.name, mode, k, seed, tag)
         tree = harness_tree.read_tree(surface, n.task_dir(runs_root, task_id) / "harnesses" / label)
@@ -756,13 +764,32 @@ def run_task(
     rolled = _roll_bases(task_id, adapter, pending, dead_dir)
     base: list[RunView] = [rolled[label] for label in labels]
 
-    res.base = [{"label": b.label, "run_id": b.run_id, "run_dir": str(b.run_dir)} for b in base]
+    res.base = [
+        {
+            "label": b.label,
+            "run_id": b.run_id,
+            "run_dir": str(b.run_dir),
+            **({"error": b.error, "infra_failed": recursion.is_infra_fault(b.error)} if not b.ok else {}),
+        }
+        for b in base
+    ]
     if not any(b.ok for b in base):
         err = "no base rollout produced anything"
         res.status = "base-failed"
         res.errors.append(err)
+        for b in base:
+            if b.error:
+                res.errors.append(f"{b.label}: {b.error}")
         for mode in modes:
-            res.modes[mode] = {"ok": False, "error": err}
+            base_ledger = ledger_store.Ledger(mode=mode, task_id=task_id, k=k)
+            for b in base:
+                base_ledger.rollout(
+                    b.label,
+                    usd=b.cost_usd,
+                    ok=b.ok,
+                    infra_failed=(not b.ok) and recursion.is_infra_fault(b.error),
+                )
+            res.modes[mode] = {"ok": False, "error": err, "ledger": base_ledger.to_dict()}
             res.selections[mode] = selection.Selection(
                 task_id=task_id, mode=mode, k=k, error=err
             ).to_dict()

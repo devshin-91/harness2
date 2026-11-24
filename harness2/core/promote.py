@@ -168,11 +168,16 @@ def promote_harness(
             stage_root = Path(stage_td)
             for rel, content in promoted_tree.items():
                 _write_lf(stage_root / harness_tree.normalize_rel(rel), content)
+            verify_env = {
+                k: v
+                for k, v in config.scrub_env().items()
+                if k.upper() != "HARNESS2_RECEIPT_HMAC_KEY"
+            }
             try:
                 proc = subprocess.run(
                     verify_cmd,
                     cwd=stage_root,
-                    env=config.scrub_env(),
+                    env=verify_env,
                     shell=True,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -214,6 +219,7 @@ def promote_harness(
     artifact_hashes: dict[str, str] = {}
     artifact_paths: dict[str, str] = {}
     empty_files: list[str] = []
+    empty_file_paths: dict[str, str] = {}
     if not dry_run:
         dst.mkdir(parents=True, exist_ok=True)
         dst_resolved = dst.resolve()
@@ -241,6 +247,7 @@ def promote_harness(
                 artifact_paths[norm_rel] = str(dest_file)
             else:
                 empty_files.append(norm_rel)
+                empty_file_paths[norm_rel] = str(dest_file)
     else:
         for rel in sorted(promoted_tree):
             norm_rel = harness_tree.normalize_rel(rel)
@@ -264,6 +271,7 @@ def promote_harness(
             "artifact_hashes": artifact_hashes,
             "artifact_paths": artifact_paths,
             "empty_files": sorted(empty_files),
+            "empty_file_paths": dict(sorted(empty_file_paths.items())),
             "files": file_hashes,
             "removed_stale_files": sorted(removed_stale),
         }

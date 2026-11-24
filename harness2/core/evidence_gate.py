@@ -40,9 +40,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
-# Explicit rollout prefixes (`base1`, `inv2`, `dom1`, `agg1`); excludes encodings like `base64`.
+# Explicit rollout prefixes (`base1`, `inv2`, `dom1`, `agg1`); excludes radix/encoding terms.
 _EXPLICIT_ROLLOUT_RE = re.compile(r"\b(?:base|inv|dom|agg)\d+\b", re.IGNORECASE)
-_EXCLUDED_BASE_TOKENS = frozenset({"base16", "base32", "base58", "base64", "base85"})
+_EXCLUDED_BASE_TOKENS = frozenset(
+    {"base2", "base8", "base10", "base16", "base32", "base58", "base64", "base85"}
+)
 # Sequential round labels (`c1`, `c2`, ...) only count when in rollout context or `valid_labels`
 # so Harness²'s own component taxonomy (`c1..c8`) and spreadsheet cells (`C2`) never false-positive.
 _CONTEXTUAL_C_ROLLOUT_RE = re.compile(
@@ -66,6 +68,7 @@ _HIDDEN_UNICODE_RANGES = (
     (0x200B, 0x200F, "ZERO_WIDTH_OR_DIRECTIONAL_MARK"),
     (0x202A, 0x202E, "BIDI_OVERRIDE"),
     (0x2060, 0x2060, "WORD_JOINER"),
+    (0x2061, 0x2064, "INVISIBLE_OPERATOR"),
     (0x2066, 0x2069, "BIDI_ISOLATE"),
     (0xFE00, 0xFE0F, "VARIATION_SELECTOR"),
     (0xFEFF, 0xFEFF, "ZERO_WIDTH_BOM"),
@@ -76,15 +79,19 @@ _HIDDEN_UNICODE_RANGES = (
 _EXFIL_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     (
         "BENCHMARK_LEAK_HOST",
-        re.compile(r"\b(?:huggingface\.co|hf\.co|raw\.githubusercontent\.com)\b", re.IGNORECASE),
+        re.compile(
+            r"\b(?:huggingface\.co|hf\.co|raw\.githubusercontent\.com|api\.github\.com/repos)\b",
+            re.IGNORECASE,
+        ),
         "references a benchmark-hosting domain that may leak grading rubrics",
     ),
     (
         "CREDENTIAL_PATH_ACCESS",
         re.compile(
-            r"(?:~|\$HOME|%USERPROFILE%|/root|/home/[^/\s]+|/Users/[^/\s]+|"
+            r"(?:~|\$\{?HOME\}?|%USERPROFILE%|/root|/home/[^/\s]+|/Users/[^/\s]+|"
             r"[A-Za-z]:[/\\]Users[/\\][^/\\\s]+)"
-            r"(?:[/\\]\.(?:ssh|aws|gcloud|netrc)|[/\\]\.config[/\\]gcloud)\b",
+            r"(?:[/\\]\.(?:ssh|aws|gcloud|netrc)|[/\\]\.config[/\\]gcloud|"
+            r"[/\\]\.gemini[/\\]antigravity-cli[/\\]settings\.json)\b",
             re.IGNORECASE,
         ),
         "references a host credential directory inside a harness file",
@@ -92,7 +99,8 @@ _EXFIL_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     (
         "SHELL_EXFIL_COMMAND",
         re.compile(
-            r"\b(?:curl|wget)\b[^\n]{0,160}(?:\$[A-Z_]*KEY|\$[A-Z_]*TOKEN|os\.environ|printenv)",
+            r"\b(?:curl|wget)\b[^\n]{0,160}"
+            r"(?:\$\{?[A-Z_]*(?:KEY|TOKEN|SECRET|CREDENTIAL)\}?|os\.environ|printenv)",
             re.IGNORECASE,
         ),
         "potential credential exfiltration via curl/wget",
@@ -100,16 +108,22 @@ _EXFIL_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
 )
 
 _NET_CLIENT_RE = re.compile(
-    r"\b(?:urllib\.request|requests\.(?:post|put|get)|http\.client|socket\.create_connection|"
-    r"socket\.socket|curl|wget)\b",
+    r"(?:\b(?:urllib\.request|from\s+urllib\s+import\s+request|requests\.(?:post|put|get)|"
+    r"axios\.(?:post|put|get|request)|http\.client|socket\.create_connection|"
+    r"socket\.socket|curl|wget)\b|\b(?:fetch|urlopen)\s*\()",
     re.IGNORECASE,
 )
 _SECRET_READ_RE = re.compile(
-    r"(?:os\.environ|os\.getenv|printenv|\$[A-Z_]*(?:KEY|TOKEN|SECRET|CREDENTIAL))",
+    r"(?:\b(?:os\.environ|os\.getenv|printenv|process\.env|Bun\.env|Deno\.env)\b|"
+    r"\$\{?[A-Z_]*(?:KEY|TOKEN|SECRET|CREDENTIAL)\}?)",
     re.IGNORECASE,
 )
 
-_MUTABLE_JUDGE_PREFIXES = ("judge", "grade", "score", "eval_")
+_TOP_LEVEL_JUDGE_FILE_RE = re.compile(
+    r"^(?:judge|grade|score|scores|eval)[a-z0-9_.-]*\.(?:json|jsonl|log|txt)$",
+    re.IGNORECASE,
+)
+_VERIFIER_MUTABLE_PATHS = frozenset({"verifier/score.json", "verifier/eval_result.json"})
 
 
 @dataclass(frozen=True)
@@ -176,8 +190,11 @@ def sha256_file(path: Path | str) -> str:
 
 
 def _is_immutable_rollout_file(rel_posix: str) -> bool:
-    name = rel_posix.rsplit("/", 1)[-1].lower()
-    if any(name.startswith(pref) for pref in _MUTABLE_JUDGE_PREFIXES):
+    """Exclude only post-hoc Harness² judge/verifier metadata; never skip solver deliverables."""
+    norm = rel_posix.strip("/")
+    if norm.lower() in _VERIFIER_MUTABLE_PATHS:
+        return False
+    if "/" not in norm and _TOP_LEVEL_JUDGE_FILE_RE.match(norm):
         return False
     return True
 
@@ -306,6 +323,30 @@ def verify_receipt(
             errs.append(
                 f"artifact `{key_name}` hash mismatch: actual={actual_hash!r} != {expected_hash!r}"
             )
+
+    # Also enforce fail-closed 0-byte integrity for promoted placeholder files (`empty_files`).
+    empty_files = receipt.get("empty_files")
+    if isinstance(empty_files, Sequence) and not isinstance(empty_files, (str, bytes)):
+        empty_paths_map = receipt.get("empty_file_paths")
+        resolved_empty: dict[str, Path] = {}
+        if isinstance(empty_paths_map, Mapping):
+            for k, v in empty_paths_map.items():
+                resolved_empty[str(k)] = Path(str(v))
+        for k, v in resolved_paths.items():
+            resolved_empty.setdefault(k, v)
+        for empty_name in sorted(str(x) for x in empty_files):
+            epath = resolved_empty.get(empty_name)
+            if epath is None:
+                errs.append(f"empty artifact path for `{empty_name}` not supplied (fail-closed)")
+                continue
+            if not epath.is_file():
+                errs.append(f"empty artifact `{empty_name}` missing on disk at {epath} (fail-closed)")
+                continue
+            sz = epath.stat().st_size
+            if sz != 0:
+                errs.append(
+                    f"empty artifact `{empty_name}` was modified on disk (size={sz} != 0, fail-closed)"
+                )
     return (not errs), errs
 
 
@@ -502,8 +543,9 @@ def scan_harness_security(tree: Mapping[str, str]) -> list[SecurityFinding]:
                             message=f"hidden Unicode code point U+{ord(ch):04X} ({ucode})",
                         )
                     )
+            norm_line = re.sub(r"\\(?:\.\\)+", r"\\", re.sub(r"/(?:\./)+", "/", re.sub(r"/{2,}", "/", line)))
             for code, rx, desc in _EXFIL_PATTERNS:
-                if rx.search(line):
+                if rx.search(line) or rx.search(norm_line):
                     findings.append(
                         SecurityFinding(
                             file_rel=norm,
