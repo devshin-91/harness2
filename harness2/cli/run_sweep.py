@@ -243,8 +243,9 @@ def _check_identity(adapter, args, namespace_dir: Path) -> None:
         "max_tasks": args.max_tasks,
         "domains": sorted(_csv(args.only_domains)),
         "seed": args.seed,
-        "blind_compose": bool(args.blind_compose),
-        "prohibition_replay": bool(args.prohibition_replay),
+        "blind_compose": bool(getattr(args, "blind_compose", False)),
+        "prohibition_replay": bool(getattr(args, "prohibition_replay", False)),
+        "verify_library_evidence": bool(getattr(args, "verify_library_evidence", False)),
     }
     namespace_dir.mkdir(parents=True, exist_ok=True)
     path = namespace_dir / "config.json"
@@ -252,6 +253,7 @@ def _check_identity(adapter, args, namespace_dir: Path) -> None:
         old = json.loads(path.read_text())
         old.setdefault("blind_compose", False)
         old.setdefault("prohibition_replay", False)
+        old.setdefault("verify_library_evidence", False)
         if old != json.loads(json.dumps(identity)):
             raise ValueError(
                 "This run directory belongs to different models, tasks, or ablation flags. "

@@ -146,9 +146,19 @@ class Library:
             self.rebuild_index()
 
     def retain(self, task_ids: Sequence[str]) -> None:
-        """Keep only the entries preceding the current task in this stream."""
+        """Keep only the entries and tombstones preceding the current task in this stream."""
         keep = {slug(task_id) for task_id in task_ids}
         self.forget([entry for entry in self.entries() if entry not in keep])
+        if self.tombstones_path.is_file():
+            kept_rows = [
+                row for row in self.tombstones() if slug(str(row.get("task_id") or "")) in keep
+            ]
+            tmp = self.tombstones_path.with_suffix(".jsonl.tmp")
+            tmp.write_text(
+                "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept_rows),
+                encoding="utf-8",
+            )
+            tmp.replace(self.tombstones_path)
 
     def add(
         self,

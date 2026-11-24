@@ -66,14 +66,24 @@ class Ledger:
         ok: bool = True,
         infra_failed: bool = False,
     ) -> None:
+        if ok and infra_failed:
+            raise ValueError(
+                f"rollout {label!r} cannot be recorded as both ok=True and infra_failed=True"
+            )
         self.entries.append(
             Entry("rollout", label, usd, cached, ok=bool(ok), infra_failed=bool(infra_failed))
         )
 
     def session(
-        self, label: str, usd: float = 0.0, *, cached: bool = False, attempts: int = 1
+        self,
+        label: str,
+        usd: float = 0.0,
+        *,
+        cached: bool = False,
+        attempts: int = 1,
+        ok: bool = True,
     ) -> None:
-        self.entries.append(Entry("session", label, usd, cached, attempts=attempts))
+        self.entries.append(Entry("session", label, usd, cached, attempts=attempts, ok=bool(ok)))
 
     @property
     def R(self) -> int:

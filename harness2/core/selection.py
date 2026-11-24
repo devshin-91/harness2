@@ -524,6 +524,7 @@ def _distil(
         diff = harness_tree.diff_summary(surface, base_t, chosen_t)
         changed = sorted(set(diff["added"]) | set(diff["modified"]) | set(diff["removed"]))
         live_labels = [lbl for lbl, rv in pool.items() if rv.ok]
+        delivered_labels = [lbl for lbl, rv in pool.items() if rv.ok and rv.delivered]
         artifact_paths = {lbl: rv.run_dir for lbl, rv in pool.items() if rv.run_dir}
         input_digest = evidence_gate.sha256_mapping(
             {
@@ -535,25 +536,28 @@ def _distil(
                 "chosen_tree": chosen_t,
             }
         )
+        receipt_path = root / "evidence_receipt.json"
         cmd_str = (
-            f"harness2 --verify-library-evidence --task {task_id} "
-            f"--mode {sel.mode} --k {sel.k}"
+            f"python -m harness2.core.evidence_gate verify "
+            f"{receipt_path.as_posix()} --exclude-judge-files"
         )
         chk = evidence_gate.verify_experience_evidence(
             out,
             valid_labels=list(pool.keys()),
             changed_components=changed,
             live_labels=live_labels,
+            delivered_labels=delivered_labels,
             artifact_paths=artifact_paths,
             require_artifacts=True,
             input_digest=input_digest,
             commit_sha=evidence_gate.git_commit_sha(root),
             command=cmd_str,
+            exclude_judge_files=True,
         )
         if chk.receipt is not None:
             receipt_dict = chk.receipt.to_dict()
             sel.evidence_receipt = receipt_dict
-            (root / "evidence_receipt.json").write_text(
+            receipt_path.write_text(
                 json.dumps(receipt_dict, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )

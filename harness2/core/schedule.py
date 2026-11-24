@@ -226,6 +226,20 @@ def _restore_libraries(
         tree = harness_tree.read_tree(surface, n.task_dir(runs_root, task_id) / "harnesses" / label)
         if not tree:
             continue
+        prov: dict = {
+            "source": "self",
+            "mode": mode,
+            "k": k,
+            "verified_refs": list(sel.get("verified_refs") or []),
+        }
+        receipt = sel.get("evidence_receipt") or {}
+        if isinstance(receipt, dict):
+            for rkey in ("commit_sha", "command", "input_digest"):
+                if receipt.get(rkey):
+                    prov[rkey] = receipt[rkey]
+            ah = receipt.get("artifact_hashes") or {}
+            if isinstance(ah, dict) and ah:
+                prov["artifact_hashes"] = [f"{k_}:{str(v_)[:16]}" for k_, v_ in sorted(ah.items())]
         lib.add(
             task_id,
             tree,
@@ -233,6 +247,7 @@ def _restore_libraries(
             label=label,
             run_id=str(sel.get("chosen_run_id") or ""),
             experience=sel.get("experience") or {},
+            provenance=prov,
         )
 
 

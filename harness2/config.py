@@ -255,12 +255,16 @@ STRICT_ENV_ALLOWLIST = frozenset(
         "XDG_STATE_HOME",
         "GOOGLE_CLOUD_PROJECT",
         "GOOGLE_CLOUD_LOCATION",
-        "GOOGLE_APPLICATION_CREDENTIALS",
+        "CLOUDSDK_CONFIG",
         "SSL_CERT_FILE",
         "REQUESTS_CA_BUNDLE",
+        "NODE_EXTRA_CA_CERTS",
         "NO_PROXY",
         "HTTP_PROXY",
         "HTTPS_PROXY",
+        "no_proxy",
+        "http_proxy",
+        "https_proxy",
     }
 )
 
@@ -288,11 +292,17 @@ def scrub_env(
     Pass `strict_allowlist=True` (or set `HARNESS2_STRICT_ENV=1`) to use the default-deny
     allowlist (`scrub_env_allowlist`) instead of the blocklist (#219).
     """
-    use_strict = STRICT_ENV if strict_allowlist is None else bool(strict_allowlist)
+    if strict_allowlist is None:
+        use_strict = env("HARNESS2_STRICT_ENV", "0") in ("1", "true", "True", "yes")
+    else:
+        use_strict = bool(strict_allowlist)
     if use_strict:
         return scrub_env_allowlist(base_env, keep=keep)
     src = os.environ if base_env is None else base_env
     drop = SCRUB_ENV - set(keep)
+    if os.name == "nt":
+        drop_upper = {k.upper() for k in drop}
+        return {k: v for k, v in src.items() if k.upper() not in drop_upper}
     return {k: v for k, v in src.items() if k not in drop}
 
 

@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .. import config
-from . import context, prohibition, prompts
+from . import context, evidence_gate, prohibition, prompts
 from . import tree as harness_tree
 from .ledger import Ledger
 from .proposer import Proposer, ProposerError
@@ -133,6 +133,10 @@ def _accept_tree(
         )
         adapter.validate_tree(new)
         context.assert_tree_has_no_grader_verdicts(new)
+        sec_findings = evidence_gate.scan_harness_security(new)
+        if sec_findings:
+            details = "; ".join(f"{f.file_rel}:{f.line} [{f.code}] {f.message}" for f in sec_findings[:3])
+            raise ValueError(f"security scan rejected proposed harness: {details}")
     except ValueError as exc:
         return kept, str(exc)
     return kept, ""
@@ -265,11 +269,18 @@ def _run_stage(
 def _record_sessions(ledger: Ledger, stages: Sequence[Stage]) -> None:
     """Record stages in stable order after their concurrent phase finishes."""
     for stage in stages:
-        ledger.session(stage.label, stage.usd, cached=stage.cached, attempts=stage.attempts)
+        ledger.session(
+            stage.label,
+            stage.usd,
+            cached=stage.cached,
+            attempts=stage.attempts,
+            ok=not stage.execution_failed,
+        )
 
 
 _INFRA_FAULT_RE = re.compile(
-    r"\b(?:429|too\s+many\s+requests|rate\s*limit|timeout|timed\s+out|oom|"
+    r"\b(?:401|403|429|unauthorized|forbidden|auth(?:entication)?\s+(?:failed|error|expired)|"
+    r"too\s+many\s+requests|rate\s*limit|timeout|timed\s+out|oom|"
     r"out\s+of\s+memory|connection\s+reset|terminated\s+due\s+to\s+error|"
     r"service\s+unavailable|503|502|504)\b",
     re.IGNORECASE,

@@ -12,35 +12,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Zero-token Tier 0 evidence-grounding gate and static security scanner for evolved harnesses.
+"""Zero-token Tier 0 evidence-grounding gate, replayable receipts, and static security scanner.
 
-Two deterministic, zero-dependency guards:
-1. `verify_experience_evidence`: checks that a reflection's `<experience>` cites actual
-   rollout labels or changed harness components from the task record instead of fabricated
-   attributions or dead rollouts (#71, #143).
-2. `scan_harness_security`: checks an evolved harness tree for hidden Unicode payloads
-   (zero-width chars, BiDi overrides, Unicode Tags block) and risky network/credential
-   exfiltration patterns before adoption or promotion (#96).
+Two deterministic, stdlib-only guards:
+1. `verify_experience_evidence` + `EvidenceReceipt` + `verify_receipt`: checks that a
+   reflection's `<experience>` cites real live rollout labels or changed harness components,
+   fails closed on missing or 0-byte delivered artifacts, emits a content-bound receipt
+   (`commit_sha`, `command`, `input_digest`, `artifact_hashes`, plus optional HMAC-SHA256
+   authentication when `HARNESS2_RECEIPT_HMAC_KEY` is configured), and ships a runnable CLI
+   (`python -m harness2.core.evidence_gate verify <receipt.json>`).
+2. `scan_harness_security`: checks ALL evolved harness files (including Markdown prompt/skill
+   surfaces) for hidden Unicode payloads and credential/benchmark exfiltration patterns (#96).
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import hmac
 import json
+import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 
-_ROLLOUT_LABEL_RE = re.compile(r"\b(?:base|inv|dom|agg|c)\d+\b", re.IGNORECASE)
+# Explicit rollout prefixes (`base1`, `inv2`, `dom1`, `agg1`); excludes encodings like `base64`.
+_EXPLICIT_ROLLOUT_RE = re.compile(r"\b(?:base|inv|dom|agg)\d+\b", re.IGNORECASE)
+_EXCLUDED_BASE_TOKENS = frozenset({"base16", "base32", "base58", "base64", "base85"})
+# Sequential round labels (`c1`, `c2`, ...) only count when in rollout context or `valid_labels`
+# so Harness²'s own component taxonomy (`c1..c8`) and spreadsheet cells (`C2`) never false-positive.
+_CONTEXTUAL_C_ROLLOUT_RE = re.compile(
+    r"\b(?:rollout|candidate|compose|round|final|selected|adopted)\s+(c\d+)\b",
+    re.IGNORECASE,
+)
+_GENERIC_BASENAMES = frozenset(
+    {
+        "skill.md",
+        "agent.md",
+        "readme.md",
+        "gemini.md",
+        "agents.md",
+        "hooks.json",
+        "systemprompt.md",
+        "guardrails.md",
+    }
+)
 
 _HIDDEN_UNICODE_RANGES = (
     (0x200B, 0x200F, "ZERO_WIDTH_OR_DIRECTIONAL_MARK"),
     (0x202A, 0x202E, "BIDI_OVERRIDE"),
+    (0x2060, 0x2060, "WORD_JOINER"),
     (0x2066, 0x2069, "BIDI_ISOLATE"),
+    (0xFE00, 0xFE0F, "VARIATION_SELECTOR"),
+    (0xFEFF, 0xFEFF, "ZERO_WIDTH_BOM"),
     (0xE0000, 0xE007F, "UNICODE_TAGS_BLOCK"),
+    (0xE0100, 0xE01EF, "VARIATION_SELECTOR_SUPPLEMENT"),
 )
 
 _EXFIL_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
@@ -51,7 +81,11 @@ _EXFIL_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ),
     (
         "CREDENTIAL_PATH_ACCESS",
-        re.compile(r"(?:~|/root|/home/[^/\s]+)/\.(?:ssh|aws|gcloud|netrc)\b", re.IGNORECASE),
+        re.compile(
+            r"(?:~|\$HOME|%USERPROFILE%|/root|/home/[^/\s]+|/Users/[^/\s]+)"
+            r"(?:[/\\]\.(?:ssh|aws|gcloud|netrc)|[/\\]\.config[/\\]gcloud)\b",
+            re.IGNORECASE,
+        ),
         "references a host credential directory inside a harness file",
     ),
     (
@@ -64,25 +98,37 @@ _EXFIL_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     ),
 )
 
-_EXEC_SURFACE_PREFIXES = ("scripts/", "plugin/", ".codex/", ".agents/hooks.json")
+_NET_CLIENT_RE = re.compile(
+    r"\b(?:urllib\.request|requests\.(?:post|put|get)|http\.client|socket\.create_connection|"
+    r"socket\.socket|curl|wget)\b",
+    re.IGNORECASE,
+)
+_SECRET_READ_RE = re.compile(
+    r"(?:os\.environ|os\.getenv|printenv|\$[A-Z_]*(?:KEY|TOKEN|SECRET|CREDENTIAL))",
+    re.IGNORECASE,
+)
+
+_MUTABLE_JUDGE_PREFIXES = ("judge", "grade", "score", "eval_")
 
 
 @dataclass(frozen=True)
 class EvidenceReceipt:
-    """Replayable cryptographic receipt binding an evidence gate verdict to exact inputs & artifacts."""
+    """Replayable content-bound receipt (optionally HMAC-SHA256 authenticated)."""
 
     status: str
     commit_sha: str
     command: str
     input_digest: str
     artifact_hashes: dict[str, str] = field(default_factory=dict)
+    artifact_paths: dict[str, str] = field(default_factory=dict)
     verified_refs: tuple[str, ...] = ()
     issues: tuple[str, ...] = ()
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     schema_version: str = "1"
+    signature_hmac_sha256: str = ""
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "schema_version": self.schema_version,
             "created_at": self.created_at,
             "status": self.status,
@@ -90,9 +136,13 @@ class EvidenceReceipt:
             "command": self.command,
             "input_digest": self.input_digest,
             "artifact_hashes": dict(sorted(self.artifact_hashes.items())),
+            "artifact_paths": dict(sorted(self.artifact_paths.items())),
             "verified_refs": list(self.verified_refs),
             "issues": list(self.issues),
         }
+        if self.signature_hmac_sha256:
+            d["signature_hmac_sha256"] = self.signature_hmac_sha256
+        return d
 
 
 @dataclass(frozen=True)
@@ -124,14 +174,37 @@ def sha256_file(path: Path | str) -> str:
     return h.hexdigest()
 
 
-def sha256_path(path: Path | str) -> str:
-    """Return hex SHA-256 digest of a file, or canonical sorted manifest digest of a directory."""
+def _is_immutable_rollout_file(rel_posix: str) -> bool:
+    name = rel_posix.rsplit("/", 1)[-1].lower()
+    if any(name.startswith(pref) for pref in _MUTABLE_JUDGE_PREFIXES):
+        return False
+    return True
+
+
+def sha256_path(path: Path | str, *, exclude_judge_files: bool = False) -> str:
+    """Return hex SHA-256 digest of a non-empty file or canonical sorted directory manifest.
+
+    Returns empty string `""` for missing paths, 0-byte empty files, or empty directories so
+    callers enforcing fail-closed semantics never pass on empty artifacts.
+    """
     p = Path(path)
     if p.is_file():
+        if p.stat().st_size == 0:
+            return ""
         return sha256_file(p)
     if p.is_dir():
         h = hashlib.sha256()
-        files = sorted(f for f in p.rglob("*") if f.is_file() and "__pycache__" not in f.parts)
+        files = sorted(
+            f
+            for f in p.rglob("*")
+            if f.is_file()
+            and "__pycache__" not in f.parts
+            and f.stat().st_size > 0
+            and (
+                not exclude_judge_files
+                or _is_immutable_rollout_file(f.relative_to(p).as_posix())
+            )
+        )
         if not files:
             return ""
         for f in files:
@@ -145,6 +218,13 @@ def sha256_mapping(mapping: Mapping[str, object]) -> str:
     """Deterministic SHA-256 digest of a JSON-serializable input mapping."""
     payload = json.dumps(mapping, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+def compute_receipt_hmac(receipt: Mapping[str, object], secret_key: str) -> str:
+    """Compute HMAC-SHA256 over the canonical receipt fields (excluding any existing signature)."""
+    body = {k: v for k, v in receipt.items() if k != "signature_hmac_sha256"}
+    canonical = json.dumps(body, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    return hmac.new(secret_key.encode("utf-8"), canonical, hashlib.sha256).hexdigest()
 
 
 def git_commit_sha(cwd: Path | str | None = None) -> str:
@@ -168,15 +248,20 @@ def git_commit_sha(cwd: Path | str | None = None) -> str:
 def verify_receipt(
     receipt: Mapping[str, object],
     *,
-    artifact_paths: Mapping[str, Path | str],
+    artifact_paths: Mapping[str, Path | str] | None = None,
     expected_input_digest: str = "",
     expected_commit_sha: str = "",
+    hmac_key: str = "",
+    exclude_judge_files: bool = False,
 ) -> tuple[bool, list[str]]:
     """Deterministically verify a saved receipt against on-disk artifacts (fail-closed)."""
     errs: list[str] = []
+    if str(receipt.get("status") or "").upper() != "PASS":
+        errs.append(f"receipt status is {receipt.get('status')!r}, not 'PASS' (fail-closed)")
     recorded_hashes = receipt.get("artifact_hashes")
     if not isinstance(recorded_hashes, Mapping) or not recorded_hashes:
-        return False, ["receipt has no recorded artifact_hashes (fail-closed)"]
+        errs.append("receipt has no recorded artifact_hashes (fail-closed)")
+        return False, errs
     if expected_input_digest and receipt.get("input_digest") != expected_input_digest:
         errs.append(
             f"input_digest mismatch: receipt={receipt.get('input_digest')!r} "
@@ -187,19 +272,51 @@ def verify_receipt(
             f"commit_sha mismatch: receipt={receipt.get('commit_sha')!r} "
             f"!= expected={expected_commit_sha!r}"
         )
-    for key, expected_hash in sorted(recorded_hashes.items()):
-        path = artifact_paths.get(str(key))
+    key = hmac_key or os.environ.get("HARNESS2_RECEIPT_HMAC_KEY", "")
+    if key:
+        sig = str(receipt.get("signature_hmac_sha256") or "")
+        expected_sig = compute_receipt_hmac(receipt, key)
+        if not sig or not hmac.compare_digest(sig, expected_sig):
+            errs.append("receipt HMAC-SHA256 signature missing or invalid (fail-closed)")
+
+    resolved_paths: dict[str, Path] = {}
+    stored_paths = receipt.get("artifact_paths")
+    if isinstance(stored_paths, Mapping):
+        for k, v in stored_paths.items():
+            resolved_paths[str(k)] = Path(str(v))
+    if artifact_paths is not None:
+        for k, v in artifact_paths.items():
+            resolved_paths[str(k)] = Path(v)
+
+    for key_name, expected_hash in sorted(recorded_hashes.items()):
+        path = resolved_paths.get(str(key_name))
         if path is None:
-            errs.append(f"artifact path for `{key}` not supplied (fail-closed)")
+            errs.append(f"artifact path for `{key_name}` not supplied (fail-closed)")
             continue
-        p = Path(path)
-        if not p.exists():
-            errs.append(f"artifact `{key}` missing on disk at {p} (fail-closed)")
+        if not path.exists():
+            errs.append(f"artifact `{key_name}` missing on disk at {path} (fail-closed)")
             continue
-        actual_hash = sha256_path(p)
+        actual_hash = sha256_path(path, exclude_judge_files=exclude_judge_files)
         if not actual_hash or actual_hash != str(expected_hash):
-            errs.append(f"artifact `{key}` hash mismatch: actual={actual_hash!r} != {expected_hash!r}")
+            errs.append(
+                f"artifact `{key_name}` hash mismatch: actual={actual_hash!r} != {expected_hash!r}"
+            )
     return (not errs), errs
+
+
+def _extract_cited_rollout_labels(text: str, valid_set: Mapping[str, str]) -> list[str]:
+    found: set[str] = set()
+    for m in _EXPLICIT_ROLLOUT_RE.finditer(text):
+        tok = m.group(0).lower()
+        if tok not in _EXCLUDED_BASE_TOKENS:
+            found.add(tok)
+    for m in _CONTEXTUAL_C_ROLLOUT_RE.finditer(text):
+        found.add(m.group(1).lower())
+    # Also recognize any valid sequential round label `c1..ck` explicitly present in `valid_set`.
+    for lbl_low in valid_set:
+        if re.fullmatch(r"c\d+", lbl_low) and re.search(rf"\b{re.escape(lbl_low)}\b", text, re.I):
+            found.add(lbl_low)
+    return sorted(found)
 
 
 def verify_experience_evidence(
@@ -208,17 +325,20 @@ def verify_experience_evidence(
     valid_labels: Sequence[str],
     changed_components: Sequence[str] = (),
     live_labels: Sequence[str] | None = None,
+    delivered_labels: Sequence[str] | None = None,
     artifact_paths: Mapping[str, Path | str] | None = None,
     require_artifacts: bool = False,
     input_digest: str = "",
     commit_sha: str = "",
     command: str = "",
+    hmac_key: str = "",
+    exclude_judge_files: bool = False,
 ) -> EvidenceCheckResult:
     """Verify `<experience>` against real rollouts, changed components, and on-disk artifact hashes.
 
     When `require_artifacts=True` (or `artifact_paths` is supplied), fails closed if any cited
-    rollout's artifact is missing or empty on disk, and binds the verdict into a replayable
-    `EvidenceReceipt` (`commit_sha`, `command`, `input_digest`, `artifact_hashes`).
+    delivered rollout's artifact is missing or 0-byte empty on disk, and binds the verdict into a
+    replayable `EvidenceReceipt`.
     """
     evidence_text = str(experience.get("evidence") or "").strip()
     edits_text = str(experience.get("edits") or "").strip()
@@ -231,20 +351,33 @@ def verify_experience_evidence(
         }
     )
 
-    if not evidence_text:
-        issues = ("empty evidence field",)
-        return EvidenceCheckResult(
-            ok=False,
-            verified_refs=(),
-            issues=issues,
-            receipt=EvidenceReceipt(
-                status="FAIL",
-                commit_sha=commit_sha,
-                command=command,
-                input_digest=computed_input,
-                issues=issues,
-            ),
+    def _build_receipt(
+        ok_flag: bool,
+        verified_list: list[str],
+        issues_list: list[str],
+        hashes: dict[str, str],
+        paths_map: dict[str, str],
+    ) -> EvidenceReceipt:
+        rec = EvidenceReceipt(
+            status="PASS" if ok_flag else "FAIL",
+            commit_sha=commit_sha,
+            command=command,
+            input_digest=computed_input,
+            artifact_hashes=hashes,
+            artifact_paths=paths_map,
+            verified_refs=tuple(sorted(set(verified_list))),
+            issues=tuple(issues_list),
         )
+        key = hmac_key or os.environ.get("HARNESS2_RECEIPT_HMAC_KEY", "")
+        if key:
+            sig = compute_receipt_hmac(rec.to_dict(), key)
+            rec = EvidenceReceipt(**{**rec.__dict__, "signature_hmac_sha256": sig})
+        return rec
+
+    if not evidence_text:
+        issues_empty = ["empty evidence field"]
+        rec = _build_receipt(False, [], issues_empty, {}, {})
+        return EvidenceCheckResult(ok=False, verified_refs=(), issues=tuple(issues_empty), receipt=rec)
 
     valid_set = {lbl.lower(): lbl for lbl in valid_labels}
     live_set = (
@@ -252,12 +385,18 @@ def verify_experience_evidence(
         if live_labels is not None
         else set(valid_set.keys())
     )
+    delivered_set = (
+        {lbl.lower() for lbl in delivered_labels}
+        if delivered_labels is not None
+        else set(live_set)
+    )
     changed_norm = [c.replace("\\", "/") for c in changed_components if c]
 
-    cited_labels = sorted({m.group(0).lower() for m in _ROLLOUT_LABEL_RE.finditer(combined)})
+    cited_labels = _extract_cited_rollout_labels(combined, valid_set)
     issues_list: list[str] = []
     verified: list[str] = []
     artifact_hashes: dict[str, str] = {}
+    recorded_paths: dict[str, str] = {}
 
     for lbl in cited_labels:
         if lbl not in valid_set:
@@ -271,7 +410,11 @@ def verify_experience_evidence(
     for comp in changed_norm:
         comp_low = comp.lower()
         basename = comp_low.rsplit("/", 1)[-1]
-        if comp_low in low_combined or (len(basename) >= 5 and basename in low_combined):
+        if comp_low in low_combined or (
+            len(basename) >= 5
+            and basename not in _GENERIC_BASENAMES
+            and basename in low_combined
+        ):
             verified.append(f"component:{comp}")
 
     if not verified:
@@ -280,43 +423,44 @@ def verify_experience_evidence(
             f"(valid rollouts: {sorted(valid_labels)[:8]}; changed: {changed_norm[:6]})"
         )
 
-    # Fail-closed on-disk artifact hash binding when artifacts are required or supplied.
+    # Fail-closed on-disk artifact hash binding for delivered rollouts.
     if require_artifacts or artifact_paths is not None:
         norm_artifacts = {str(k).lower(): (str(k), Path(v)) for k, v in (artifact_paths or {}).items()}
         if require_artifacts and not norm_artifacts:
             issues_list.append("no on-disk artifact paths supplied (fail-closed)")
         else:
-            # Check every cited live rollout; if none cited, check all supplied artifacts.
+            cited_delivered = [
+                lbl for lbl in cited_labels if lbl in valid_set and lbl in delivered_set
+            ]
             targets_to_hash: list[tuple[str, Path | None]] = []
-            cited_live = [lbl for lbl in cited_labels if lbl in valid_set and lbl in live_set]
-            if cited_live:
-                for lbl in cited_live:
+            if cited_delivered:
+                for lbl in cited_delivered:
                     entry = norm_artifacts.get(lbl)
                     targets_to_hash.append((valid_set[lbl], entry[1] if entry else None))
             else:
-                for orig_k, path in sorted(norm_artifacts.values()):
-                    targets_to_hash.append((orig_k, path))
+                # Contrast lessons citing only non-delivered base + component: hash delivered artifacts.
+                for low_k, (orig_k, path) in sorted(norm_artifacts.items()):
+                    if low_k in delivered_set or not valid_set:
+                        targets_to_hash.append((orig_k, path))
 
-            for key, path in targets_to_hash:
+            if require_artifacts and not targets_to_hash:
+                issues_list.append("no delivered artifact available to bind receipt (fail-closed)")
+
+            for key_name, path in targets_to_hash:
                 if path is None or not path.exists():
-                    issues_list.append(f"artifact for `{key}` is missing on disk (fail-closed)")
+                    issues_list.append(f"artifact for `{key_name}` is missing on disk (fail-closed)")
                     continue
-                digest = sha256_path(path)
+                digest = sha256_path(path, exclude_judge_files=exclude_judge_files)
                 if not digest:
-                    issues_list.append(f"artifact for `{key}` at {path} is empty (fail-closed)")
+                    issues_list.append(
+                        f"artifact for `{key_name}` at {path} is empty (fail-closed)"
+                    )
                     continue
-                artifact_hashes[key] = digest
+                artifact_hashes[key_name] = digest
+                recorded_paths[key_name] = str(path)
 
     ok = not issues_list
-    receipt = EvidenceReceipt(
-        status="PASS" if ok else "FAIL",
-        commit_sha=commit_sha,
-        command=command,
-        input_digest=computed_input,
-        artifact_hashes=artifact_hashes,
-        verified_refs=tuple(sorted(set(verified))),
-        issues=tuple(issues_list),
-    )
+    receipt = _build_receipt(ok, verified, issues_list, artifact_hashes, recorded_paths)
     return EvidenceCheckResult(
         ok=ok,
         verified_refs=receipt.verified_refs,
@@ -334,21 +478,17 @@ def _hidden_unicode_code(ch: str) -> str | None:
 
 
 def scan_harness_security(tree: Mapping[str, str]) -> list[SecurityFinding]:
-    """Static pre-adoption scan for hidden Unicode instructions and exfiltration patterns (#96)."""
+    """Static pre-adoption scan across ALL harness files (Markdown + executable surfaces) (#96)."""
     findings: list[SecurityFinding] = []
     for rel in sorted(tree):
         norm = rel.replace("\\", "/")
         body = str(tree.get(rel) or "")
-        is_exec_file = (
-            norm == ".agents/hooks.json"
-            or norm == ".codex/hooks.json"
-            or norm.startswith(_EXEC_SURFACE_PREFIXES)
-            or "/scripts/" in norm
-        )
         for line_no, line in enumerate(body.splitlines(), 1):
+            seen_ucodes: set[str] = set()
             for ch in line:
                 ucode = _hidden_unicode_code(ch)
-                if ucode is not None:
+                if ucode is not None and ucode not in seen_ucodes:
+                    seen_ucodes.add(ucode)
                     findings.append(
                         SecurityFinding(
                             file_rel=norm,
@@ -357,16 +497,49 @@ def scan_harness_security(tree: Mapping[str, str]) -> list[SecurityFinding]:
                             message=f"hidden Unicode code point U+{ord(ch):04X} ({ucode})",
                         )
                     )
-                    break
-            if is_exec_file:
-                for code, rx, desc in _EXFIL_PATTERNS:
-                    if rx.search(line):
-                        findings.append(
-                            SecurityFinding(
-                                file_rel=norm,
-                                line=line_no,
-                                code=code,
-                                message=desc,
-                            )
+            for code, rx, desc in _EXFIL_PATTERNS:
+                if rx.search(line):
+                    findings.append(
+                        SecurityFinding(
+                            file_rel=norm,
+                            line=line_no,
+                            code=code,
+                            message=desc,
                         )
+                    )
+        # File-level multi-line exfiltration check (e.g. os.environ + urllib.request/requests).
+        if _NET_CLIENT_RE.search(body) and _SECRET_READ_RE.search(body):
+            findings.append(
+                SecurityFinding(
+                    file_rel=norm,
+                    line=1,
+                    code="MULTILINE_CREDENTIAL_EXFIL",
+                    message="file combines host environment/secret reads with outbound network client",
+                )
+            )
     return findings
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for replaying/verifying a saved evidence receipt (`verify <receipt.json>`)."""
+    p = argparse.ArgumentParser(prog="python -m harness2.core.evidence_gate")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    vp = sub.add_parser("verify", help="Verify a saved evidence_receipt.json against disk")
+    vp.add_argument("receipt", type=Path, help="Path to evidence_receipt.json or promotion_manifest.json")
+    vp.add_argument("--exclude-judge-files", action="store_true")
+    args = p.parse_args(argv)
+
+    if args.cmd == "verify":
+        data = json.loads(args.receipt.read_text(encoding="utf-8"))
+        ok, errs = verify_receipt(data, exclude_judge_files=args.exclude_judge_files)
+        if ok:
+            print(f"PASS: verified {len(data.get('artifact_hashes') or {})} artifact(s)")
+            return 0
+        for e in errs:
+            print(f"FAIL: {e}", file=sys.stderr)
+        return 1
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

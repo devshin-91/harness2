@@ -15,26 +15,27 @@
 """Zero-token deterministic c8 Completion & Safety Gate for Antigravity lifecycle hooks (#161).
 
 Runs as a stdlib-only command hook (`python -m harness2.gates.completion_gate <Event>`):
-  - PreToolUse: blocks destructive commands, credential reads, and (optionally) benchmark
-    rubric hosts (`huggingface.co`, `hf.co`, `raw.githubusercontent.com`); auto-allows
-    read-only/test workspace commands when enabled to prevent confirmation fatigue.
-  - PostToolUse: records modified file paths into a per-conversation dirty queue (<10ms, 0 tok).
-  - Stop: runs deterministic checks on dirty/required artifacts (Python syntax compile,
-    24,000-byte GEMINI.md/AGENTS.md rule budget, required deliverable files & section headings,
-    optional verify command, optional external checker such as `ref_factcheck`).
-      * PASS -> `{"decision": "allow"}` (0 bytes injected into model context, 0 extra turns)
-        plus a 0-token `metadata.user_markdown` badge queued for PreInvocation.
-      * FAIL -> `{"decision": "continue", "reason": "<compact diff of up to 8 defects>"}`
-        guarded by BOTH `continuationActive` and `executionNum >= max_continuations` (default 2).
-  - PreInvocation: emits the saved 0-token `user_markdown` badge and clears it.
+  - PreToolUse: blocks destructive commands (`rm -rf`/`rm -fr`/`rm -r -f`, force-push except
+    `--force-with-lease`), host credential reads (via shell OR `read_file`/`view_file`), and
+    (optionally) benchmark rubric hosts; optionally auto-allows strictly metacharacter-free
+    read-only/test workspace commands.
+  - PostToolUse: atomically records modified file paths into a per-conversation dirty queue.
+  - Stop: always evaluates deterministic checks (including on `continuationActive=True` retry
+    turns!), writes a replayable `gate_receipt.json` (`commit_sha`, `command`, `input_digest`,
+    `artifact_hashes`, optional HMAC-SHA256), clears the dirty queue ONLY on `PASS`, and caps
+    `continue` continuations at `executionNum < max_continuations` so failures are never masked
+    and infinite loops cannot occur.
+  - PreInvocation: emits the saved 0-token `user_markdown` receipt badge and clears it.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -44,22 +45,26 @@ from pathlib import Path
 AGY_RULE_MAX_BYTES = 24_000
 RULE_FILENAMES = frozenset({"GEMINI.md", "GEMINI.ko.md", "GEMINI.en.md", "AGENTS.md"})
 
-_DANGEROUS_CMD_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("DESTRUCTIVE_RM", re.compile(r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+(?:/|~|\*|\.\.)")),
-    ("DESTRUCTIVE_GIT_PUSH", re.compile(r"\bgit\s+push\b[^\n]*(?:--force|-f)\b")),
-    ("CREDENTIAL_ACCESS", re.compile(r"(?:~|/root|/home/[^/\s]+)/\.(?:ssh|aws|gcloud|netrc)\b")),
+_DESTRUCTIVE_GIT_PUSH_RE = re.compile(
+    r"\bgit\s+push\b[^\n]*(?:(?:--force(?!-with-lease)|-f)(?:\s|$)|\s\+\S+)",
+    re.IGNORECASE,
 )
-
+_CREDENTIAL_PATH_RE = re.compile(
+    r"(?:~|\$HOME|%USERPROFILE%|/root|/home/[^/\s]+|/Users/[^/\s]+)"
+    r"(?:[/\\]\.(?:ssh|aws|gcloud|netrc)|[/\\]\.config[/\\]gcloud)\b",
+    re.IGNORECASE,
+)
 _BENCHMARK_LEAK_HOST_RE = re.compile(
     r"\b(?:huggingface\.co|hf\.co|raw\.githubusercontent\.com|api\.github\.com/repos)\b",
     re.IGNORECASE,
 )
-
 _SAFE_READONLY_CMD_RE = re.compile(
     r"^\s*(?:pytest|python3?\s+-m\s+(?:unittest|pytest|py_compile|ref_factcheck)|"
-    r"ruff\s+check|git\s+(?:status|diff|log)|ls|dir)\b",
+    r"ruff\s+check|git\s+(?:status|diff|log)|ls|dir)(?:\s|$)",
     re.IGNORECASE,
 )
+_SHELL_META_RE = re.compile(r"[;&|`$><\r\n]")
+_DANGEROUS_RM_TARGETS = frozenset({"/", "~", "*", "..", "/*", "~/", "../"})
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,42 @@ class GateIssue:
     code: str
     target: str
     message: str
+
+
+def _is_destructive_rm(cmd: str) -> bool:
+    """Detect `rm` with recursive + force flags in any order/separation targeting broad paths."""
+    if not re.search(r"\brm\b", cmd):
+        return False
+    try:
+        tokens = shlex.split(cmd, posix=(os.name != "nt"))
+    except ValueError:
+        tokens = cmd.split()
+    for i, tok in enumerate(tokens):
+        if tok.lower() not in ("rm", "/bin/rm", "/usr/bin/rm"):
+            continue
+        has_r = False
+        has_f = False
+        targets: list[str] = []
+        for arg in tokens[i + 1 :]:
+            if arg in (";", "&&", "||", "|", "&"):
+                break
+            if arg == "--recursive":
+                has_r = True
+            elif arg == "--force":
+                has_f = True
+            elif arg.startswith("-") and not arg.startswith("--"):
+                flags = arg[1:]
+                if "r" in flags or "R" in flags:
+                    has_r = True
+                if "f" in flags:
+                    has_f = True
+            else:
+                targets.append(arg.strip("\"'"))
+        if has_r and has_f and any(
+            t in _DANGEROUS_RM_TARGETS or t.startswith(("/", "~", "..", "*")) for t in targets
+        ):
+            return True
+    return False
 
 
 def _state_dir(payload: dict) -> Path:
@@ -86,7 +127,8 @@ def _workspace_root(payload: dict) -> Path:
     cwd = payload.get("cwd")
     if isinstance(cwd, str) and cwd.strip():
         return Path(cwd.strip())
-    return Path.cwd()
+    cur = Path.cwd()
+    return cur.parent if cur.name == ".agents" else cur
 
 
 def _extract_edited_path(tool_call: dict, ws_root: Path) -> Path | None:
@@ -110,7 +152,9 @@ def _load_dirty(state_file: Path) -> list[str]:
 
 
 def _save_dirty(state_file: Path, paths: list[str]) -> None:
-    state_file.write_text(json.dumps({"dirty": sorted(set(paths))}, indent=2), encoding="utf-8")
+    tmp = state_file.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"dirty": sorted(set(paths))}, indent=2), encoding="utf-8")
+    os.replace(tmp, state_file)
 
 
 def evaluate_pre_tool_use(
@@ -119,19 +163,40 @@ def evaluate_pre_tool_use(
     block_leak_hosts: bool = True,
     auto_allow_safe_cmds: bool = False,
 ) -> dict:
-    """Evaluate a PreToolUse event: deny unsafe/leak commands, optionally auto-allow safe ones."""
+    """Evaluate a PreToolUse event: deny unsafe/leak commands & credential reads."""
     tc = payload.get("toolCall") or {}
     tname = str(tc.get("name") or "")
     args = tc.get("args") or {}
-    cmd = str(args.get("CommandLine") or args.get("command") or "")
 
+    # Guard file-read tools against direct host credential reads.
+    if tname in ("read_file", "view_file", "read_resource"):
+        target_path = str(
+            args.get("Path") or args.get("AbsolutePath") or args.get("path") or args.get("file_path") or ""
+        )
+        if target_path and _CREDENTIAL_PATH_RE.search(target_path):
+            return {
+                "decision": "deny",
+                "reason": f"[harness2-gate:CREDENTIAL_ACCESS] Blocked read of credential path: {target_path[:140]}",
+            }
+        return {}
+
+    cmd = str(args.get("CommandLine") or args.get("command") or "")
     if tname in ("run_command", "bash", "shell") and cmd.strip():
-        for code, rx in _DANGEROUS_CMD_PATTERNS:
-            if rx.search(cmd):
-                return {
-                    "decision": "deny",
-                    "reason": f"[harness2-gate:{code}] Blocked dangerous command: {cmd[:140]}",
-                }
+        if _is_destructive_rm(cmd):
+            return {
+                "decision": "deny",
+                "reason": f"[harness2-gate:DESTRUCTIVE_RM] Blocked destructive command: {cmd[:140]}",
+            }
+        if _DESTRUCTIVE_GIT_PUSH_RE.search(cmd):
+            return {
+                "decision": "deny",
+                "reason": f"[harness2-gate:DESTRUCTIVE_GIT_PUSH] Blocked force-push command: {cmd[:140]}",
+            }
+        if _CREDENTIAL_PATH_RE.search(cmd):
+            return {
+                "decision": "deny",
+                "reason": f"[harness2-gate:CREDENTIAL_ACCESS] Blocked credential access: {cmd[:140]}",
+            }
         if block_leak_hosts and _BENCHMARK_LEAK_HOST_RE.search(cmd):
             return {
                 "decision": "deny",
@@ -140,7 +205,7 @@ def evaluate_pre_tool_use(
                     "external benchmark host."
                 ),
             }
-        if auto_allow_safe_cmds and _SAFE_READONLY_CMD_RE.match(cmd) and "&&" not in cmd and ";" not in cmd and "|" not in cmd:
+        if auto_allow_safe_cmds and _SAFE_READONLY_CMD_RE.match(cmd) and not _SHELL_META_RE.search(cmd):
             return {"decision": "allow"}
     return {}
 
@@ -179,6 +244,7 @@ def _check_requirements(
     ws_root: Path,
     required_files: list[str],
     required_sections: list[str],
+    dirty_paths: list[Path] = (),
 ) -> list[GateIssue]:
     issues: list[GateIssue] = []
     present_texts: list[str] = []
@@ -210,18 +276,34 @@ def _check_requirements(
         else:
             present_texts.append(body.lower())
 
-    if required_sections and present_texts:
-        corpus = "\n".join(present_texts)
-        for sec in required_sections:
-            s = sec.strip()
-            if s and s.lower() not in corpus:
-                issues.append(
-                    GateIssue(
-                        code="MISSING_REQUIRED_SECTION",
-                        target=s,
-                        message=f"required audit/report section `{s}` is missing from deliverables",
-                    )
+    if required_sections and not required_files:
+        for p in dirty_paths:
+            if p.is_file() and p.suffix.lower() in (".md", ".txt"):
+                txt = p.read_text(encoding="utf-8", errors="replace")
+                if txt.strip():
+                    present_texts.append(txt.lower())
+
+    if required_sections:
+        if not present_texts and not any(i.code == "MISSING_REQUIRED_DELIVERABLE" for i in issues):
+            issues.append(
+                GateIssue(
+                    code="MISSING_REQUIRED_SECTION",
+                    target=", ".join(s.strip() for s in required_sections if s.strip()),
+                    message="no markdown/text deliverable available to verify required sections",
                 )
+            )
+        elif present_texts:
+            corpus = "\n".join(present_texts)
+            for sec in required_sections:
+                s = sec.strip()
+                if s and s.lower() not in corpus:
+                    issues.append(
+                        GateIssue(
+                            code="MISSING_REQUIRED_SECTION",
+                            target=s,
+                            message=f"required audit/report section `{s}` is missing from deliverables",
+                        )
+                    )
     return issues
 
 
@@ -287,9 +369,10 @@ def _git_commit_sha(ws_root: Path) -> str:
 
 def _collect_artifact_hashes(
     ws_root: Path, dirty_paths: list[Path], required_files: list[str]
-) -> tuple[dict[str, str], list[GateIssue]]:
-    """Hash every verifiable dirty/required artifact on disk; report missing paths."""
+) -> tuple[dict[str, str], dict[str, str], list[GateIssue]]:
+    """Hash every verifiable dirty/required artifact on disk; report missing or 0-byte paths."""
     hashes: dict[str, str] = {}
+    paths_map: dict[str, str] = {}
     missing_issues: list[GateIssue] = []
     seen: list[Path] = []
     for p in dirty_paths:
@@ -319,8 +402,18 @@ def _collect_artifact_hashes(
                 )
             )
             continue
+        if p.stat().st_size == 0:
+            missing_issues.append(
+                GateIssue(
+                    code="EMPTY_ARTIFACT",
+                    target=key,
+                    message=f"tracked artifact `{key}` is 0 bytes on disk (fail-closed)",
+                )
+            )
+            continue
         hashes[key] = _sha256_file(p)
-    return hashes, missing_issues
+        paths_map[key] = str(p.resolve())
+    return hashes, paths_map, missing_issues
 
 
 def evaluate_stop(
@@ -337,9 +430,10 @@ def evaluate_stop(
 ) -> tuple[dict, str]:
     """Evaluate Stop hook; returns `(hook_output_dict, user_badge_markdown)`.
 
-    Populates `receipt_out` (when provided) with a replayable cryptographic receipt binding
-    `commit_sha`, `command`, `input_digest`, and per-file `artifact_hashes` so a reader can
-    verify or replay the check instead of trusting a bare status badge.
+    Always runs deterministic verification (including on `continuationActive=True` retry turns)
+    so `receipt_out` reflects the true `PASS`/`FAIL` state. Loop-cap guards only bound whether
+    another `{"decision": "continue"}` is emitted, preventing both infinite loops and unverified
+    passes.
     """
     term_reason = str(payload.get("terminationReason") or "")
     cont_active = bool(payload.get("continuationActive", False))
@@ -361,23 +455,20 @@ def evaluate_stop(
         ).encode("utf-8")
     ).hexdigest()
 
-    # Dual loop guard: continuationActive AND executionNum >= max_continuations.
-    if (
-        cont_active
-        or exec_num >= max_continuations
-        or term_reason in ("USER_CANCELED", "ERROR", "MAX_INVOCATIONS", "MAX_FORCED_INVOCATIONS")
-    ):
+    if term_reason in ("USER_CANCELED", "ERROR", "MAX_INVOCATIONS", "MAX_FORCED_INVOCATIONS"):
         if receipt_out is not None:
             receipt_out.clear()
             receipt_out.update(
                 {
                     "schema_version": "1",
                     "created_at": datetime.now(timezone.utc).isoformat(),
-                    "status": "SKIPPED_GUARD",
+                    "status": "ABORTED",
+                    "termination_reason": term_reason,
                     "commit_sha": commit_sha,
                     "command": verify_cmd.strip(),
                     "input_digest": input_digest,
                     "artifact_hashes": {},
+                    "artifact_paths": {},
                     "issues": [],
                 }
             )
@@ -385,13 +476,18 @@ def evaluate_stop(
 
     issues: list[GateIssue] = []
     issues.extend(_check_dirty_files(dirty_paths))
-    issues.extend(_check_requirements(ws_root, list(required_files), list(required_sections)))
-    artifact_hashes, missing_art_issues = _collect_artifact_hashes(
+    issues.extend(
+        _check_requirements(ws_root, list(required_files), list(required_sections), list(dirty_paths))
+    )
+    artifact_hashes, artifact_paths, missing_art_issues = _collect_artifact_hashes(
         ws_root, list(dirty_paths), list(required_files)
     )
     if require_artifacts:
-        # Avoid duplicating MISSING_REQUIRED_DELIVERABLE already emitted by _check_requirements.
-        already_missing = {i.target for i in issues if i.code == "MISSING_REQUIRED_DELIVERABLE"}
+        already_missing = {
+            i.target
+            for i in issues
+            if i.code in ("MISSING_REQUIRED_DELIVERABLE", "EMPTY_DELIVERABLE")
+        }
         for miss in missing_art_issues:
             if miss.target not in already_missing:
                 issues.append(miss)
@@ -403,10 +499,10 @@ def evaluate_stop(
                     message="no verifiable artifact found on disk (fail-closed)",
                 )
             )
-    if dirty_paths or required_files:
+    if dirty_paths or required_files or verify_cmd.strip():
         issues.extend(_run_verify_cmd(ws_root, verify_cmd))
 
-    receipt_data = {
+    receipt_data: dict = {
         "schema_version": "1",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "PASS" if not issues else "FAIL",
@@ -414,10 +510,18 @@ def evaluate_stop(
         "command": verify_cmd.strip(),
         "input_digest": input_digest,
         "artifact_hashes": dict(sorted(artifact_hashes.items())),
+        "artifact_paths": dict(sorted(artifact_paths.items())),
         "issues": [
             {"code": i.code, "target": i.target, "message": i.message} for i in issues
         ],
     }
+    hmac_key = os.environ.get("HARNESS2_RECEIPT_HMAC_KEY", "")
+    if hmac_key:
+        canonical = json.dumps(receipt_data, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        receipt_data["signature_hmac_sha256"] = hmac.new(
+            hmac_key.encode("utf-8"), canonical, hashlib.sha256
+        ).hexdigest()
+
     if receipt_out is not None:
         receipt_out.clear()
         receipt_out.update(receipt_data)
@@ -432,6 +536,10 @@ def evaluate_stop(
             else ""
         )
         return {"decision": "allow"}, badge
+
+    # Loop-cap guard: once continuation budget is exhausted, stop looping WITHOUT falsifying PASS.
+    if exec_num >= max_continuations or (cont_active and exec_num >= max(1, max_continuations)):
+        return {"decision": "allow"}, ""
 
     compact_lines = [
         f"[harness2-completion-gate FAIL ({len(issues)} issue(s)); fix before finishing]:"
@@ -450,13 +558,13 @@ def build_hooks_json(python_exe: str = "python") -> dict:
         "harness2-completion-gate": {
             "PreToolUse": [
                 {
-                    "matcher": "run_command",
+                    "matcher": "run_command|read_file|view_file",
                     "hooks": [{"type": "command", "command": f"{base_cmd} PreToolUse", "timeout": 10}],
                 }
             ],
             "PostToolUse": [
                 {
-                    "matcher": "write_file|edit_file",
+                    "matcher": "write_file|edit_file|write_to_file|replace_file_content|multi_replace_file_content",
                     "hooks": [{"type": "command", "command": f"{base_cmd} PostToolUse", "timeout": 10}],
                 }
             ],
@@ -522,7 +630,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if event == "Stop":
         dirty_paths = [Path(p) for p in _load_dirty(dirty_file)]
-        _save_dirty(dirty_file, [])
         max_cont = int(os.environ.get("HARNESS2_MAX_CONTINUATIONS", "2"))
         req_artifacts = os.environ.get("HARNESS2_REQUIRE_ARTIFACTS", "0") == "1"
         receipt_data: dict = {}
@@ -537,15 +644,20 @@ def main(argv: list[str] | None = None) -> int:
             require_artifacts=req_artifacts,
             receipt_out=receipt_data,
         )
+        # Clear dirty queue ONLY on PASS (or hard abort), never on FAIL!
+        if receipt_data.get("status") in ("PASS", "ABORTED"):
+            _save_dirty(dirty_file, [])
         if receipt_data:
             receipt_path = Path(
                 os.environ.get("HARNESS2_RECEIPT_PATH") or (sdir / "gate_receipt.json")
             )
             receipt_path.parent.mkdir(parents=True, exist_ok=True)
-            receipt_path.write_text(
+            tmp = receipt_path.with_suffix(f".{os.getpid()}.tmp")
+            tmp.write_text(
                 json.dumps(receipt_data, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
+            os.replace(tmp, receipt_path)
         if badge:
             badge_payload = {
                 "injectSteps": [
