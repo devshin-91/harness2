@@ -180,6 +180,78 @@ class EvidenceGateAndLibraryTests(unittest.TestCase):
         self.assertEqual(exp, {})
         self.assertTrue(sel.decline_reason.startswith("evidence_unverified:"))
 
+    def test_evidence_receipt_fail_closed_and_replay_verification(self):
+        good = {
+            "cue": "When reconciling credits and debits",
+            "lesson": "Keep signed values in scripts/summarize.py",
+            "evidence": "Compared base1 vs inv1: scripts/summarize.py kept negative rows.",
+        }
+        # 1. Fail closed when require_artifacts=True and cited rollout artifact is missing.
+        art_base = self.root / "art_base1.txt"
+        art_base.write_text("Total: 100.00\n", encoding="utf-8")
+        missing_inv = self.root / "art_inv1_missing.txt"
+        res_missing = evidence_gate.verify_experience_evidence(
+            good,
+            valid_labels=["base1", "inv1"],
+            changed_components=["scripts/summarize.py"],
+            live_labels=["base1", "inv1"],
+            artifact_paths={"base1": art_base, "inv1": missing_inv},
+            require_artifacts=True,
+            commit_sha="deadbeef1234",
+            command="harness2 --verify-library-evidence --task ledger-1",
+        )
+        self.assertFalse(res_missing.ok)
+        self.assertTrue(any("missing on disk (fail-closed)" in i for i in res_missing.issues))
+        self.assertIsNotNone(res_missing.receipt)
+        self.assertEqual(res_missing.receipt.status, "FAIL")
+
+        # 2. Pass with complete replayable receipt once both artifacts exist on disk.
+        art_inv = self.root / "art_inv1.txt"
+        art_inv.write_text("Total: 85.15\n", encoding="utf-8")
+        res_ok = evidence_gate.verify_experience_evidence(
+            good,
+            valid_labels=["base1", "inv1"],
+            changed_components=["scripts/summarize.py"],
+            live_labels=["base1", "inv1"],
+            artifact_paths={"base1": art_base, "inv1": art_inv},
+            require_artifacts=True,
+            commit_sha="deadbeef1234",
+            command="harness2 --verify-library-evidence --task ledger-1",
+        )
+        self.assertTrue(res_ok.ok, res_ok.issues)
+        receipt = res_ok.receipt.to_dict()
+        self.assertEqual(receipt["commit_sha"], "deadbeef1234")
+        self.assertIn("--verify-library-evidence", receipt["command"])
+        self.assertEqual(len(receipt["input_digest"]), 64)
+        self.assertEqual(
+            receipt["artifact_hashes"]["inv1"], evidence_gate.sha256_file(art_inv)
+        )
+
+        # 3. Replay verifier passes on unchanged files and fails closed on tamper or deletion.
+        ok_replay, errs = evidence_gate.verify_receipt(
+            receipt,
+            artifact_paths={"base1": art_base, "inv1": art_inv},
+            expected_input_digest=receipt["input_digest"],
+            expected_commit_sha="deadbeef1234",
+        )
+        self.assertTrue(ok_replay, errs)
+
+        art_inv.write_text("Total: TAMPERED\n", encoding="utf-8")
+        ok_tamper, errs_tamper = evidence_gate.verify_receipt(
+            receipt, artifact_paths={"base1": art_base, "inv1": art_inv}
+        )
+        self.assertFalse(ok_tamper)
+        self.assertTrue(any("hash mismatch" in e for e in errs_tamper))
+
+        art_inv.unlink()
+        ok_gone, errs_gone = evidence_gate.verify_receipt(
+            receipt, artifact_paths={"base1": art_base, "inv1": art_inv}
+        )
+        self.assertFalse(ok_gone)
+        self.assertTrue(
+            any("missing on disk" in e and "fail-closed" in e for e in errs_gone), errs_gone
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

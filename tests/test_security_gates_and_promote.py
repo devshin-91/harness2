@@ -159,6 +159,31 @@ class SecurityGatesAndPromoteTests(unittest.TestCase):
         step = pre_out["injectSteps"][0]["systemMessage"]
         self.assertEqual(step["systemMessage"], "")  # 0 model tokens!
         self.assertIn("PASS", step["metadata"]["user_markdown"])
+        self.assertIn("gate_receipt.json", step["metadata"]["user_markdown"])
+
+        # 6. Replayable receipt written to disk with command, input_digest, and artifact SHA-256.
+        receipt_files = list((self.root / "gate_state").rglob("gate_receipt.json"))
+        self.assertEqual(len(receipt_files), 1)
+        receipt = json.loads(receipt_files[0].read_text(encoding="utf-8"))
+        self.assertEqual(receipt["status"], "PASS")
+        self.assertEqual(len(receipt["input_digest"]), 64)
+        self.assertIn("good.py", receipt["artifact_hashes"])
+        self.assertIn("report.md", receipt["artifact_hashes"])
+
+        # 7. Fail closed when require_artifacts=True and no verifiable artifact exists.
+        empty_ws = self.root / "empty_ws"
+        empty_ws.mkdir()
+        fc_receipt: dict = {}
+        out_fc, _ = completion_gate.evaluate_stop(
+            {"executionNum": 0, "continuationActive": False},
+            dirty_paths=[],
+            ws_root=empty_ws,
+            require_artifacts=True,
+            receipt_out=fc_receipt,
+        )
+        self.assertEqual(out_fc["decision"], "continue")
+        self.assertIn("MISSING_ARTIFACT", out_fc["reason"])
+        self.assertEqual(fc_receipt["status"], "FAIL")
 
     def test_promote_harness_validates_security_and_pinned_policy(self):
         evolved = self.root / "evolved"
@@ -177,15 +202,22 @@ class SecurityGatesAndPromoteTests(unittest.TestCase):
         pinned.write_text("# Immutable Core\nAlways verify before asserting.\n", encoding="utf-8")
         prod = self.root / "prod"
 
+        verify_cmd = f'"{sys.executable}" scripts/verify.py'
         res = promote.promote_harness(
             evolved,
             prod,
             surface=ANTIGRAVITY_SURFACE,
             pinned_policy=pinned,
-            verify_cmd=f'"{sys.executable}" scripts/verify.py',
+            verify_cmd=verify_cmd,
         )
         self.assertTrue(res.ok, res.errors)
-        self.assertTrue((prod / "promotion_manifest.json").is_file())
+        manifest_file = prod / "promotion_manifest.json"
+        self.assertTrue(manifest_file.is_file())
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["command"], verify_cmd)
+        self.assertEqual(len(manifest["input_digest"]), 64)
+        self.assertIn("commit_sha", manifest)
+        self.assertIn("GEMINI.md", manifest["files"])
         prod_gemini = (prod / "GEMINI.md").read_text(encoding="utf-8")
         self.assertIn("Always verify before asserting.", prod_gemini)
         self.assertIn("audit_flow", prod_gemini)

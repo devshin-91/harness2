@@ -38,6 +38,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 AGY_RULE_MAX_BYTES = 24_000
@@ -259,6 +260,69 @@ def _run_verify_cmd(ws_root: Path, verify_cmd: str, timeout: int = 20) -> list[G
     return []
 
 
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _git_commit_sha(ws_root: Path) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ws_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+def _collect_artifact_hashes(
+    ws_root: Path, dirty_paths: list[Path], required_files: list[str]
+) -> tuple[dict[str, str], list[GateIssue]]:
+    """Hash every verifiable dirty/required artifact on disk; report missing paths."""
+    hashes: dict[str, str] = {}
+    missing_issues: list[GateIssue] = []
+    seen: list[Path] = []
+    for p in dirty_paths:
+        if p not in seen:
+            seen.append(p)
+    for rel in required_files:
+        rel_clean = rel.strip()
+        if not rel_clean:
+            continue
+        p = Path(rel_clean)
+        if not p.is_absolute():
+            p = ws_root / p
+        if p not in seen:
+            seen.append(p)
+
+    for p in seen:
+        try:
+            key = p.resolve().relative_to(ws_root.resolve()).as_posix()
+        except ValueError:
+            key = p.as_posix()
+        if not p.is_file():
+            missing_issues.append(
+                GateIssue(
+                    code="MISSING_ARTIFACT",
+                    target=key,
+                    message=f"tracked artifact `{key}` is missing on disk (fail-closed)",
+                )
+            )
+            continue
+        hashes[key] = _sha256_file(p)
+    return hashes, missing_issues
+
+
 def evaluate_stop(
     payload: dict,
     *,
@@ -268,11 +332,34 @@ def evaluate_stop(
     required_sections: list[str] = (),
     verify_cmd: str = "",
     max_continuations: int = 2,
+    require_artifacts: bool = False,
+    receipt_out: dict | None = None,
 ) -> tuple[dict, str]:
-    """Evaluate Stop hook; returns `(hook_output_dict, user_badge_markdown)`."""
+    """Evaluate Stop hook; returns `(hook_output_dict, user_badge_markdown)`.
+
+    Populates `receipt_out` (when provided) with a replayable cryptographic receipt binding
+    `commit_sha`, `command`, `input_digest`, and per-file `artifact_hashes` so a reader can
+    verify or replay the check instead of trusting a bare status badge.
+    """
     term_reason = str(payload.get("terminationReason") or "")
     cont_active = bool(payload.get("continuationActive", False))
     exec_num = int(payload.get("executionNum") or 0)
+
+    commit_sha = _git_commit_sha(ws_root)
+    input_digest = hashlib.sha256(
+        json.dumps(
+            {
+                "required_files": sorted(str(f).strip() for f in required_files if str(f).strip()),
+                "required_sections": sorted(
+                    str(s).strip() for s in required_sections if str(s).strip()
+                ),
+                "verify_cmd": verify_cmd.strip(),
+                "last_user_input": str(payload.get("lastUserInput") or ""),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
 
     # Dual loop guard: continuationActive AND executionNum >= max_continuations.
     if (
@@ -280,19 +367,67 @@ def evaluate_stop(
         or exec_num >= max_continuations
         or term_reason in ("USER_CANCELED", "ERROR", "MAX_INVOCATIONS", "MAX_FORCED_INVOCATIONS")
     ):
+        if receipt_out is not None:
+            receipt_out.clear()
+            receipt_out.update(
+                {
+                    "schema_version": "1",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "status": "SKIPPED_GUARD",
+                    "commit_sha": commit_sha,
+                    "command": verify_cmd.strip(),
+                    "input_digest": input_digest,
+                    "artifact_hashes": {},
+                    "issues": [],
+                }
+            )
         return {"decision": "allow"}, ""
 
     issues: list[GateIssue] = []
     issues.extend(_check_dirty_files(dirty_paths))
     issues.extend(_check_requirements(ws_root, list(required_files), list(required_sections)))
+    artifact_hashes, missing_art_issues = _collect_artifact_hashes(
+        ws_root, list(dirty_paths), list(required_files)
+    )
+    if require_artifacts:
+        # Avoid duplicating MISSING_REQUIRED_DELIVERABLE already emitted by _check_requirements.
+        already_missing = {i.target for i in issues if i.code == "MISSING_REQUIRED_DELIVERABLE"}
+        for miss in missing_art_issues:
+            if miss.target not in already_missing:
+                issues.append(miss)
+        if not artifact_hashes and not issues:
+            issues.append(
+                GateIssue(
+                    code="MISSING_ARTIFACT",
+                    target="workspace",
+                    message="no verifiable artifact found on disk (fail-closed)",
+                )
+            )
     if dirty_paths or required_files:
         issues.extend(_run_verify_cmd(ws_root, verify_cmd))
 
+    receipt_data = {
+        "schema_version": "1",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "status": "PASS" if not issues else "FAIL",
+        "commit_sha": commit_sha,
+        "command": verify_cmd.strip(),
+        "input_digest": input_digest,
+        "artifact_hashes": dict(sorted(artifact_hashes.items())),
+        "issues": [
+            {"code": i.code, "target": i.target, "message": i.message} for i in issues
+        ],
+    }
+    if receipt_out is not None:
+        receipt_out.clear()
+        receipt_out.update(receipt_data)
+
     if not issues:
-        checked = len(dirty_paths) + len([f for f in required_files if f.strip()])
+        checked = len(artifact_hashes)
+        commit_tag = f"commit `{commit_sha[:8]}`, " if commit_sha else ""
         badge = (
-            f"**[harness2 c8 gate: PASS]** {checked} artifact(s) verified deterministically "
-            f"(0 LLM tokens)."
+            f"**[harness2 c8 gate: PASS]** {checked} artifact(s) hashed & verified "
+            f"({commit_tag}input `{input_digest[:12]}`, receipt `gate_receipt.json`, 0 LLM tokens)."
             if checked
             else ""
         )
@@ -389,6 +524,8 @@ def main(argv: list[str] | None = None) -> int:
         dirty_paths = [Path(p) for p in _load_dirty(dirty_file)]
         _save_dirty(dirty_file, [])
         max_cont = int(os.environ.get("HARNESS2_MAX_CONTINUATIONS", "2"))
+        req_artifacts = os.environ.get("HARNESS2_REQUIRE_ARTIFACTS", "0") == "1"
+        receipt_data: dict = {}
         out, badge = evaluate_stop(
             payload,
             dirty_paths=dirty_paths,
@@ -397,7 +534,18 @@ def main(argv: list[str] | None = None) -> int:
             required_sections=_csv_env("HARNESS2_REQUIRED_SECTIONS"),
             verify_cmd=os.environ.get("HARNESS2_VERIFY_CMD", ""),
             max_continuations=max_cont,
+            require_artifacts=req_artifacts,
+            receipt_out=receipt_data,
         )
+        if receipt_data:
+            receipt_path = Path(
+                os.environ.get("HARNESS2_RECEIPT_PATH") or (sdir / "gate_receipt.json")
+            )
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            receipt_path.write_text(
+                json.dumps(receipt_data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
         if badge:
             badge_payload = {
                 "injectSteps": [

@@ -25,8 +25,13 @@ Two deterministic, zero-dependency guards:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
-from dataclasses import dataclass
+import subprocess
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Mapping, Sequence
 
 _ROLLOUT_LABEL_RE = re.compile(r"\b(?:base|inv|dom|agg|c)\d+\b", re.IGNORECASE)
@@ -63,12 +68,41 @@ _EXEC_SURFACE_PREFIXES = ("scripts/", "plugin/", ".codex/", ".agents/hooks.json"
 
 
 @dataclass(frozen=True)
+class EvidenceReceipt:
+    """Replayable cryptographic receipt binding an evidence gate verdict to exact inputs & artifacts."""
+
+    status: str
+    commit_sha: str
+    command: str
+    input_digest: str
+    artifact_hashes: dict[str, str] = field(default_factory=dict)
+    verified_refs: tuple[str, ...] = ()
+    issues: tuple[str, ...] = ()
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    schema_version: str = "1"
+
+    def to_dict(self) -> dict:
+        return {
+            "schema_version": self.schema_version,
+            "created_at": self.created_at,
+            "status": self.status,
+            "commit_sha": self.commit_sha,
+            "command": self.command,
+            "input_digest": self.input_digest,
+            "artifact_hashes": dict(sorted(self.artifact_hashes.items())),
+            "verified_refs": list(self.verified_refs),
+            "issues": list(self.issues),
+        }
+
+
+@dataclass(frozen=True)
 class EvidenceCheckResult:
     """Outcome of deterministic Tier 0 citation verification on a reflection experience."""
 
     ok: bool
     verified_refs: tuple[str, ...]
     issues: tuple[str, ...]
+    receipt: EvidenceReceipt | None = None
 
 
 @dataclass(frozen=True)
@@ -81,19 +115,136 @@ class SecurityFinding:
     message: str
 
 
+def sha256_file(path: Path | str) -> str:
+    """Return hex SHA-256 digest of a file's raw bytes."""
+    h = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def sha256_path(path: Path | str) -> str:
+    """Return hex SHA-256 digest of a file, or canonical sorted manifest digest of a directory."""
+    p = Path(path)
+    if p.is_file():
+        return sha256_file(p)
+    if p.is_dir():
+        h = hashlib.sha256()
+        files = sorted(f for f in p.rglob("*") if f.is_file() and "__pycache__" not in f.parts)
+        if not files:
+            return ""
+        for f in files:
+            rel = f.relative_to(p).as_posix()
+            h.update(f"{rel}:{sha256_file(f)}\n".encode("utf-8"))
+        return h.hexdigest()
+    return ""
+
+
+def sha256_mapping(mapping: Mapping[str, object]) -> str:
+    """Deterministic SHA-256 digest of a JSON-serializable input mapping."""
+    payload = json.dumps(mapping, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def git_commit_sha(cwd: Path | str | None = None) -> str:
+    """Return current git HEAD commit SHA if inside a git repository, else empty string."""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+def verify_receipt(
+    receipt: Mapping[str, object],
+    *,
+    artifact_paths: Mapping[str, Path | str],
+    expected_input_digest: str = "",
+    expected_commit_sha: str = "",
+) -> tuple[bool, list[str]]:
+    """Deterministically verify a saved receipt against on-disk artifacts (fail-closed)."""
+    errs: list[str] = []
+    recorded_hashes = receipt.get("artifact_hashes")
+    if not isinstance(recorded_hashes, Mapping) or not recorded_hashes:
+        return False, ["receipt has no recorded artifact_hashes (fail-closed)"]
+    if expected_input_digest and receipt.get("input_digest") != expected_input_digest:
+        errs.append(
+            f"input_digest mismatch: receipt={receipt.get('input_digest')!r} "
+            f"!= expected={expected_input_digest!r}"
+        )
+    if expected_commit_sha and receipt.get("commit_sha") != expected_commit_sha:
+        errs.append(
+            f"commit_sha mismatch: receipt={receipt.get('commit_sha')!r} "
+            f"!= expected={expected_commit_sha!r}"
+        )
+    for key, expected_hash in sorted(recorded_hashes.items()):
+        path = artifact_paths.get(str(key))
+        if path is None:
+            errs.append(f"artifact path for `{key}` not supplied (fail-closed)")
+            continue
+        p = Path(path)
+        if not p.exists():
+            errs.append(f"artifact `{key}` missing on disk at {p} (fail-closed)")
+            continue
+        actual_hash = sha256_path(p)
+        if not actual_hash or actual_hash != str(expected_hash):
+            errs.append(f"artifact `{key}` hash mismatch: actual={actual_hash!r} != {expected_hash!r}")
+    return (not errs), errs
+
+
 def verify_experience_evidence(
     experience: Mapping[str, str],
     *,
     valid_labels: Sequence[str],
     changed_components: Sequence[str] = (),
     live_labels: Sequence[str] | None = None,
+    artifact_paths: Mapping[str, Path | str] | None = None,
+    require_artifacts: bool = False,
+    input_digest: str = "",
+    commit_sha: str = "",
+    command: str = "",
 ) -> EvidenceCheckResult:
-    """Verify that `<experience>` cites real rollouts or changed components, not fabrications."""
+    """Verify `<experience>` against real rollouts, changed components, and on-disk artifact hashes.
+
+    When `require_artifacts=True` (or `artifact_paths` is supplied), fails closed if any cited
+    rollout's artifact is missing or empty on disk, and binds the verdict into a replayable
+    `EvidenceReceipt` (`commit_sha`, `command`, `input_digest`, `artifact_hashes`).
+    """
     evidence_text = str(experience.get("evidence") or "").strip()
     edits_text = str(experience.get("edits") or "").strip()
     combined = f"{evidence_text}\n{edits_text}".strip()
+    computed_input = input_digest or sha256_mapping(
+        {
+            "valid_labels": sorted(valid_labels),
+            "changed_components": sorted(changed_components),
+            "experience": dict(experience),
+        }
+    )
+
     if not evidence_text:
-        return EvidenceCheckResult(ok=False, verified_refs=(), issues=("empty evidence field",))
+        issues = ("empty evidence field",)
+        return EvidenceCheckResult(
+            ok=False,
+            verified_refs=(),
+            issues=issues,
+            receipt=EvidenceReceipt(
+                status="FAIL",
+                commit_sha=commit_sha,
+                command=command,
+                input_digest=computed_input,
+                issues=issues,
+            ),
+        )
 
     valid_set = {lbl.lower(): lbl for lbl in valid_labels}
     live_set = (
@@ -104,14 +255,15 @@ def verify_experience_evidence(
     changed_norm = [c.replace("\\", "/") for c in changed_components if c]
 
     cited_labels = sorted({m.group(0).lower() for m in _ROLLOUT_LABEL_RE.finditer(combined)})
-    issues: list[str] = []
+    issues_list: list[str] = []
     verified: list[str] = []
+    artifact_hashes: dict[str, str] = {}
 
     for lbl in cited_labels:
         if lbl not in valid_set:
-            issues.append(f"fabricated rollout reference `{lbl}` not present in task record")
+            issues_list.append(f"fabricated rollout reference `{lbl}` not present in task record")
         elif lbl not in live_set:
-            issues.append(f"cited rollout `{valid_set[lbl]}` did not complete with live evidence")
+            issues_list.append(f"cited rollout `{valid_set[lbl]}` did not complete with live evidence")
         else:
             verified.append(f"rollout:{valid_set[lbl]}")
 
@@ -123,15 +275,53 @@ def verify_experience_evidence(
             verified.append(f"component:{comp}")
 
     if not verified:
-        issues.append(
+        issues_list.append(
             "evidence cites neither a real rollout label nor a modified harness component "
             f"(valid rollouts: {sorted(valid_labels)[:8]}; changed: {changed_norm[:6]})"
         )
 
-    return EvidenceCheckResult(
-        ok=not issues,
+    # Fail-closed on-disk artifact hash binding when artifacts are required or supplied.
+    if require_artifacts or artifact_paths is not None:
+        norm_artifacts = {str(k).lower(): (str(k), Path(v)) for k, v in (artifact_paths or {}).items()}
+        if require_artifacts and not norm_artifacts:
+            issues_list.append("no on-disk artifact paths supplied (fail-closed)")
+        else:
+            # Check every cited live rollout; if none cited, check all supplied artifacts.
+            targets_to_hash: list[tuple[str, Path | None]] = []
+            cited_live = [lbl for lbl in cited_labels if lbl in valid_set and lbl in live_set]
+            if cited_live:
+                for lbl in cited_live:
+                    entry = norm_artifacts.get(lbl)
+                    targets_to_hash.append((valid_set[lbl], entry[1] if entry else None))
+            else:
+                for orig_k, path in sorted(norm_artifacts.values()):
+                    targets_to_hash.append((orig_k, path))
+
+            for key, path in targets_to_hash:
+                if path is None or not path.exists():
+                    issues_list.append(f"artifact for `{key}` is missing on disk (fail-closed)")
+                    continue
+                digest = sha256_path(path)
+                if not digest:
+                    issues_list.append(f"artifact for `{key}` at {path} is empty (fail-closed)")
+                    continue
+                artifact_hashes[key] = digest
+
+    ok = not issues_list
+    receipt = EvidenceReceipt(
+        status="PASS" if ok else "FAIL",
+        commit_sha=commit_sha,
+        command=command,
+        input_digest=computed_input,
+        artifact_hashes=artifact_hashes,
         verified_refs=tuple(sorted(set(verified))),
-        issues=tuple(issues),
+        issues=tuple(issues_list),
+    )
+    return EvidenceCheckResult(
+        ok=ok,
+        verified_refs=receipt.verified_refs,
+        issues=receipt.issues,
+        receipt=receipt,
     )
 
 

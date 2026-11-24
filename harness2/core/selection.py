@@ -66,6 +66,7 @@ class Selection:
     evidence: str = "deliverable"
     decline_reason: str = ""
     verified_refs: list[str] = field(default_factory=list)
+    evidence_receipt: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
@@ -523,12 +524,39 @@ def _distil(
         diff = harness_tree.diff_summary(surface, base_t, chosen_t)
         changed = sorted(set(diff["added"]) | set(diff["modified"]) | set(diff["removed"]))
         live_labels = [lbl for lbl, rv in pool.items() if rv.ok]
+        artifact_paths = {lbl: rv.run_dir for lbl, rv in pool.items() if rv.run_dir}
+        input_digest = evidence_gate.sha256_mapping(
+            {
+                "task_id": task_id,
+                "mode": sel.mode,
+                "k": sel.k,
+                "chosen_label": sel.chosen_label,
+                "base_tree": base_t,
+                "chosen_tree": chosen_t,
+            }
+        )
+        cmd_str = (
+            f"harness2 --verify-library-evidence --task {task_id} "
+            f"--mode {sel.mode} --k {sel.k}"
+        )
         chk = evidence_gate.verify_experience_evidence(
             out,
             valid_labels=list(pool.keys()),
             changed_components=changed,
             live_labels=live_labels,
+            artifact_paths=artifact_paths,
+            require_artifacts=True,
+            input_digest=input_digest,
+            commit_sha=evidence_gate.git_commit_sha(root),
+            command=cmd_str,
         )
+        if chk.receipt is not None:
+            receipt_dict = chk.receipt.to_dict()
+            sel.evidence_receipt = receipt_dict
+            (root / "evidence_receipt.json").write_text(
+                json.dumps(receipt_dict, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
         if not chk.ok:
             sel.decline_reason = f"evidence_unverified: {'; '.join(chk.issues)}"[:300]
             return {}

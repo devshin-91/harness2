@@ -612,6 +612,19 @@ def _run_one_mode(
     if sel.ok and chosen is not None and not chosen.delivered:
         res.errors.append(f"{mode}: selected run {chosen.run_id} produced no deliverable")
     if mode_lib and sel.ok and library_store.has_experience(sel.experience):
+        prov: dict = {
+            "source": "self",
+            "mode": mode,
+            "k": k,
+            "verified_refs": sel.verified_refs,
+        }
+        if sel.evidence_receipt:
+            for rkey in ("commit_sha", "command", "input_digest"):
+                if sel.evidence_receipt.get(rkey):
+                    prov[rkey] = sel.evidence_receipt[rkey]
+            ah = sel.evidence_receipt.get("artifact_hashes") or {}
+            if ah:
+                prov["artifact_hashes"] = [f"{k_}:{v_[:16]}" for k_, v_ in sorted(ah.items())]
         mode_lib.add(
             task_id,
             chosen_tree,
@@ -619,12 +632,7 @@ def _run_one_mode(
             label=sel.chosen_label,
             run_id=sel.chosen_run_id,
             experience=sel.experience,
-            provenance={
-                "source": "self",
-                "mode": mode,
-                "k": k,
-                "verified_refs": sel.verified_refs,
-            },
+            provenance=prov,
         )
     elif mode_lib and sel.ok:
         mode_lib.record_tombstone(

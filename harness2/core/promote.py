@@ -45,6 +45,8 @@ class PromotionResult:
     target_dir: Path
     promoted_files: tuple[str, ...] = ()
     pinned_policy_sha256: str = ""
+    commit_sha: str = ""
+    input_digest: str = ""
     manifest_path: Path | None = None
     errors: tuple[str, ...] = ()
     security_findings: tuple[evidence_gate.SecurityFinding, ...] = field(default_factory=tuple)
@@ -172,14 +174,30 @@ def promote_harness(
             dest_file.parent.mkdir(parents=True, exist_ok=True)
             dest_file.write_text(content, encoding="utf-8")
 
+    commit_sha = evidence_gate.git_commit_sha(src)
+    target_commit_sha = evidence_gate.git_commit_sha(dst)
+    input_digest = evidence_gate.sha256_mapping(
+        {
+            "surface": surface.name,
+            "evolved_tree": evolved,
+            "pinned_policy_sha256": pinned_sha,
+            "command": verify_cmd.strip(),
+        }
+    )
+
     manifest_path: Path | None = None
     if not dry_run:
         dst.mkdir(parents=True, exist_ok=True)
         manifest_path = dst / "promotion_manifest.json"
         manifest = {
+            "schema_version": "1",
             "promoted_at": datetime.now(timezone.utc).isoformat(),
             "surface": surface.name,
             "source_dir": str(src),
+            "commit_sha": commit_sha,
+            "target_commit_sha": target_commit_sha,
+            "command": verify_cmd.strip(),
+            "input_digest": input_digest,
             "pinned_policy_sha256": pinned_sha,
             "files": file_hashes,
         }
@@ -191,5 +209,7 @@ def promote_harness(
         target_dir=dst,
         promoted_files=tuple(sorted(promoted_tree)),
         pinned_policy_sha256=pinned_sha,
+        commit_sha=commit_sha,
+        input_digest=input_digest,
         manifest_path=manifest_path,
     )
